@@ -9,6 +9,18 @@
       "database_name": "pgcf-edge-test",
     },
   ],
+  // The API handler that takes the nodes' reports in these tests records the digest of a reported
+  // backup from the archive bucket, so the suite binds one.
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "pgcf-edge-test",
+      "jurisdiction": "eu",
+    },
+  ],
+  "vars": {
+    "ARCHIVE_BUCKET_NAME": "pgcf-edge-test",
+  },
   "durable_objects": {
     "bindings": [
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
@@ -19,6 +31,16 @@
     { "tag": "v1", "new_sqlite_classes": ["DatabaseActor", "NodeActor"] },
   ],
   "ratelimits": [
+    {
+      "name": "SOURCE_RATE_LIMITER",
+      "namespace_id": "5",
+      // High here: the suite's many connections share one test address. The source limit is
+      // exercised with a limiter of its own in edge.test.ts.
+      "simple": {
+        "limit": 100000,
+        "period": 60,
+      },
+    },
     {
       "name": "DATABASE_CONNECTION_RATE_LIMITER",
       "namespace_id": "3",

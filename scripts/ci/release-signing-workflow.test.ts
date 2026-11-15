@@ -28,11 +28,13 @@ const code = (text: string) =>
 test("the signing job holds no secret: it proves itself to the signer with its run's identity token", () => {
   // A secret of the repository is handed to any branch's workflow, and the key is not a secret of
   // GitHub at all: it is the signer Worker's, which nobody can read. No job names it, and the
-  // signing job names no secret of any kind and no environment.
+  // signing job names no secret of any kind. Its one environment is `release`, which the signer
+  // requires in the token: the owner's protection rules on it are what keep a push from signing alone.
   assert.doesNotMatch(code(workflow), /RELEASE_SIGNING_KEY/);
   const job = code(jobs["sign-release"]!);
   assert.doesNotMatch(job, /secrets\./);
-  assert.doesNotMatch(job, /^ {4}environment:/m);
+  assert.equal(job.match(/^ {4}environment:/gm)?.length, 1);
+  assert.match(job, /^ {4}environment: release$/m);
   assert.doesNotMatch(job, /GH_TOKEN|github\.token/);
   // A commit whose `check` job failed (cargo test runs the agent's signature tests there) is not
   // signed, and neither is one whose image did not build and boot.

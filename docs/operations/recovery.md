@@ -275,6 +275,21 @@ database moves (plan 7.11, 9.4).
    records (`DELETE /zones/{zone}/dns_records/{record}`). Never delete a `pgcf-` record whose Tunnel
    is alive, and never a record by name pattern alone: the cleanup of 2026-10-22 deleted only a
    record whose target was one of the account's own deleted Tunnels.
+   **Suspected compromise.** When the restore catalog of a lost node's archive is read, the objects that
+   node uploaded after its fence are ignored, so the base backup and the WAL range a restore starts from
+   are the ones written before it. A restore or replacement from a source on a lost node that is not yet
+   fenced is refused with the retryable `not_ready`, and a retention pass skips such a node. A backup
+   is trusted only while its objects still match the digest the Worker recorded when the node first reported
+   it done, or the one-time backfill recorded for an archive written before digests existed. Only once the
+   backfill has marked an archive is a backup never recorded not restored from; a recorded backup that changed is left out, and
+   the restore refuses the archive (`archive_digest_mismatch`) only when no trusted backup remains, while
+   retention deletes nothing from it. The restoring node's own `wal-fetch` still reads the live archive prefix, though, and the R2 credentials
+   the node was given stay valid for their 7 days after the fence. When compromise of the node is
+   suspected, the operator therefore replaces the R2 parent key as a planned step, with the owner's
+   approval, by the procedure of [the node credentials](credentials.md#node-credentials): delete the old
+   token only after the check described there, because deleting it ends every credential it signed at
+   once, healthy nodes fail archiving (`database_archive_failing`) until they read new ones, and the
+   bucket is shared by every region.
 4. Only when the status is `fenced`, restore the affected databases onto healthy capacity with the
    separate-target restore procedure above. Each restore is a new database with a new ID; the
    integrator rebinds. The last archived commit is what comes back, not the last acknowledged one
@@ -295,7 +310,8 @@ database moves (plan 7.11, 9.4).
    acknowledges that loss with `POST /v1/nodes/{id}/reinstall-override` and a reason.
 7. The reinstall brings the node back empty: recover mode restores nothing, and each database
    is restored from R2 as a new database with the restore procedure above (a new ID; the
-   integrator rebinds).
+   integrator rebinds). A database deleted on a lost node is purged with its retained archive once
+   that archive expires, after the fence: its node never reports the deletion.
 
 **Measured (EU1).** Fence: within 30 s of `mark-lost` (2026-10-19). Reinstall: AddNode in recover
 mode reached `ready` after 231 s on 2026-10-19; the pull install alone took 196.5 s from the rescue
@@ -454,7 +470,7 @@ created at full size at first boot and does not grow.
   `reserve_bytes` and metadata below `metadata_no_room_percent`. The refusal is `57P03` with the
   DETAIL "storage"; running databases keep running. Cloudflare places no new database or restore on
   a node whose pool is at 80 % of its data or 50 % of its metadata, whose sold storage reached
-  four times its data (counting the smallest size class on offer as sold), or that holds 1,000
+  150 % of its data (counting the smallest size class on offer as sold), or that holds 1,000
   volumes, the largest count Stage 1 measured (`regional_node_pool_closed`, which fires when
   no node of the region takes the smallest size class, for the pool, the RAM or the CPU; the bound counts sleeping databases too and is no policy field: only
   a measurement at a higher count raises it). Sold sizes do not reserve space. `thin_storage_blocked` fires when the pool has no room. Free space by deleting

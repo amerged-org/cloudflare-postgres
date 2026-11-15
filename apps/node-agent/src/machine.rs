@@ -425,12 +425,12 @@ pub trait Machine: Send + Sync + 'static {
     fn installed_packages(
         &self,
     ) -> impl Future<Output = io::Result<BTreeMap<String, String>>> + Send;
-    /// Installs exactly these package versions from the Debian snapshot `snapshot`, and these
-    /// package files, with apt and without asking anything.
+    /// Installs these package files, each already checked against the lock's digest, with apt and
+    /// without asking anything. Apt downloads nothing (`--no-download`): a package that the files
+    /// do not supply is an error, never an install from the archive.
     fn install_packages(
         &self,
         snapshot: &str,
-        versions: &[String],
         files: &[PathBuf],
     ) -> impl Future<Output = io::Result<()>> + Send;
     /// Purges these packages (`update::purgeable`) with dpkg, which refuses one that an installed

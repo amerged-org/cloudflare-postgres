@@ -385,9 +385,15 @@ impl Lock {
                 .as_array()?
                 .iter()
                 .map(|entry| {
+                    let name = entry["name"]
+                        .as_str()
+                        .filter(|name| is_package_name(name))?;
+                    let version = entry["version"]
+                        .as_str()
+                        .filter(|version| is_version(version))?;
                     Some(Package {
-                        name: entry["name"].as_str()?.to_string(),
-                        version: entry["version"].as_str()?.to_string(),
+                        name: name.to_string(),
+                        version: version.to_string(),
                         pinned: Pinned {
                             url: entry["url"].as_str()?.to_string(),
                             sha256: entry["sha256"].as_str()?.to_string(),
@@ -407,9 +413,9 @@ impl Lock {
 /// What a maintenance cycle installs.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// `name=version` for apt, of the packages the node lacks or has in another version.
-    pub versions: Vec<String>,
-    /// The extra packages to download and install as files.
+    /// Every package the node lacks or has in another version, each with the file its lock pins: the
+    /// cycle downloads each one, checks it against the lock's sha256 and size, and installs only
+    /// those files, so no package reaches the node that the signed lock does not name.
     pub files: Vec<Package>,
     /// The kernel or a core library changes: the node reboots.
     pub reboot: bool,
@@ -427,20 +433,31 @@ fn needs_reboot(name: &str) -> bool {
     name.starts_with("linux-image-") || matches!(name, "libc6" | "systemd" | "libsystemd0" | "udev")
 }
 
-/// What differs between the lock and the node: nothing, once the node has the lock's versions.
+/// What differs between the lock and the node: nothing, once the node has the lock's versions. A
+/// package named by both lists is planned once, from the packages.
 pub fn plan(lock: &Lock, installed: &BTreeMap<String, String>) -> Plan {
     let differs = |package: &&Package| installed.get(&package.name) != Some(&package.version);
-    let packages: Vec<&Package> = lock.packages.iter().filter(differs).collect();
-    let files: Vec<Package> = lock.extra.iter().filter(differs).cloned().collect();
-    Plan {
-        versions: packages
+    let mut files: Vec<Package> = lock.packages.iter().filter(differs).cloned().collect();
+    files.extend(
+        lock.extra
             .iter()
-            .map(|package| format!("{}={}", package.name, package.version))
-            .collect(),
-        reboot: packages.iter().any(|package| needs_reboot(&package.name))
-            || files.iter().any(|package| needs_reboot(&package.name)),
+            .filter(differs)
+            .filter(|package| !lock.packages.iter().any(|other| other.name == package.name))
+            .cloned(),
+    );
+    Plan {
+        reboot: files.iter().any(|package| needs_reboot(&package.name)),
         files,
     }
+}
+
+/// Whether `version` is a Debian version the lock may name, and one that is a part of a file name
+/// as it is: letters, digits and `. + ~ : -`, never a slash.
+pub fn is_version(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'~' | b':' | b'-'))
 }
 
 /// Whether `name` is a Debian package name as the image's lock states one
@@ -636,6 +653,28 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_entry_whose_name_or_version_is_no_file_name_part_is_refused() {
+        // Each package becomes a file `<name>_<version>.deb` under the agent's directory, so a name
+        // or a version that could leave it (a slash, a dot-dot name) is no lock at all.
+        let entry = |name: &str, version: &str| {
+            format!(
+                r#"{{"debian":{{"snapshot":"20261016T000000Z"}},"extra":[],"packages":[{{"name":"{name}","version":"{version}","architecture":"all","url":"https://snapshot.example/a.deb","sha256":"{}","size":100}}]}}"#,
+                "2".repeat(64)
+            )
+        };
+        assert!(Lock::parse(entry("adduser", "3.152").as_bytes()).is_some());
+        assert!(Lock::parse(entry("adduser", "3.152+b1~deb13:1").as_bytes()).is_some());
+        assert_eq!(
+            Lock::parse(entry("adduser", "1.0/../../x").as_bytes()),
+            None
+        );
+        assert_eq!(Lock::parse(entry("adduser", "").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("../adduser", "3.152").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("Adduser", "3.152").as_bytes()), None);
+        assert_eq!(Lock::parse(entry("a", "3.152").as_bytes()), None);
+    }
+
+    #[test]
     fn only_what_differs_from_the_node_is_installed_and_a_kernel_takes_a_reboot() {
         let current = installed(&[
             ("bash", "5.2"),
@@ -653,14 +692,32 @@ mod tests {
             ("cloudflared", "2026.10.0"),
         ]);
         let planned = plan(&lock(), &older);
-        assert_eq!(planned.versions, ["postgresql-18=18.7-1"]);
-        assert_eq!(planned.files[0].name, "cloudflared");
+        let names = |planned: &Plan| {
+            planned
+                .files
+                .iter()
+                .map(|package| package.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&planned), ["postgresql-18", "cloudflared"]);
+        // Each file is the one the lock pins, so it is checked against the lock's digest and size.
+        assert_eq!(planned.files[0].pinned, lock().packages[2].pinned);
+        assert_eq!(planned.files[1].pinned, lock().extra[0].pinned);
         assert!(!planned.reboot);
         // A kernel the node does not have yet: its package is new, and the node reboots.
         let without = installed(&[("bash", "5.2"), ("postgresql-18", "18.7-1")]);
         let planned = plan(&lock(), &without);
-        assert_eq!(planned.versions, ["linux-image-6.12.99-amd64=6.12.99-1"]);
+        assert_eq!(
+            names(&planned),
+            ["linux-image-6.12.99-amd64", "cloudflared"]
+        );
         assert!(planned.reboot);
+        // A package that both lists name is one file, not two.
+        let both = Lock {
+            packages: vec![lock().extra[0].clone()],
+            extra: vec![lock().extra[0].clone()],
+        };
+        assert_eq!(names(&plan(&both, &BTreeMap::new())), ["cloudflared"]);
     }
 
     #[test]

@@ -263,6 +263,11 @@ test("the agent runs in a mount namespace of its own: its volumes never reach PI
   }
 });
 
+test("the agent may hold 65536 descriptors, so one uid's connections to the archive socket cannot exhaust its table", () => {
+  const unit = readFileSync(new URL("pgcf-agent.service", units), "utf8");
+  assert.deepEqual(assignments(unit, "LimitNOFILE"), ["65536"]);
+});
+
 test("a killed agent is started again within a quarter of a second, and a start that fails waits in the agent", () => {
   // The first wake after `kill -9` of the agent waits for the next process: systemd starts it after
   // RestartSec (1 s on EU1, 2026-10-23, of 46 s to the first served wake). The back-off of a start
@@ -289,6 +294,20 @@ test("the three oneshots that MountImages= pulls into every start are masked: a 
     assert.equal(lstatSync(mask).isSymbolicLink(), true, module);
     assert.equal(readlinkSync(mask), "/dev/null", module);
   }
+});
+
+eachDatabaseUnit("a database's log lines are rate limited for its own unit: one database's warnings cannot evict the node's journal", (unit) => {
+  // journald keeps one budget per service; a loop of RAISE WARNING with large text fills the shared
+  // journal in minutes at the default of 10,000 lines per 30 s, and evicts the operator's lines. The
+  // rate limit is a [Service] setting; in [Unit] systemd would not apply it.
+  const limits = directives(unit).filter((directive) => directive.key.includes("LogRateLimit"));
+  assert.deepEqual(
+    limits.map(({ section, key, value }) => ({ section, key, value })),
+    [
+      { section: "Service", key: "Service.LogRateLimitIntervalSec", value: "30s" },
+      { section: "Service", key: "Service.LogRateLimitBurst", value: "1000" },
+    ],
+  );
 });
 
 eachDatabaseUnit("a database's private /dev/shm cannot run code, hold setuid files or hold device nodes", (unit) => {

@@ -44,7 +44,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UnixStream},
     sync::{OwnedSemaphorePermit, oneshot, watch},
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use zeroize::Zeroizing;
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -63,6 +63,10 @@ pub const LIFETIME: Duration = Duration::from_secs(60);
 const POOLED_PER_ROLE: usize = 4;
 /// The time a request has to send its body.
 const BODY_BOUND: Duration = Duration::from_secs(10);
+/// The most a request's statements may run before the gateway cancels them. It is longer than the
+/// thirty seconds of a schedule's run, so PostgreSQL's own statement timeout normally answers
+/// first; a schedule's statements cannot lengthen it.
+pub const STATEMENT_BOUND: Duration = Duration::from_secs(35);
 
 /// A refusal in the driver's error format, answered with HTTP 400, and its log outcome.
 #[derive(Debug)]
@@ -124,7 +128,9 @@ fn not_accepting(outcome: &'static str) -> Refused {
 fn connection_failed(outcome: &'static str) -> Refused {
     refused(outcome, "08006", "database connection failed")
 }
-/// After the statement bytes were written: PostgreSQL may have committed them.
+/// After the statement bytes were written: PostgreSQL may have committed them. Also when the
+/// gateway had no memory for the answer (`memory_capacity`): the answer is not too large, its
+/// memory was not there, and the statements had been sent.
 fn unknown(outcome: &'static str) -> Refused {
     refused(
         outcome,
@@ -279,6 +285,9 @@ struct Backend {
     generation: u64,
     /// What PostgreSQL proved; none when it asked for no password, and then it is not pooled.
     verifier: Option<Verifier>,
+    /// The session's BackendKeyData (process id and secret key), which names it to a cancel
+    /// request; none until its startup gave one.
+    key: Option<[u8; 8]>,
     authenticated: Instant,
     /// The memory the session holds while it exists.
     _memory: Lease,
@@ -414,7 +423,10 @@ async fn handle(
     }
     let route = attempt!(admitted_route(&head, gateway));
     stages.database = Some(route.database().to_string());
-    let body = attempt!(read_body(socket, head).await);
+    // The request holds its memory from the body on, against its database's budget, until it has
+    // run: a cold request that waits for a wake holds it too.
+    let mut memory = gateway.memory.lease(route.database());
+    let body = attempt!(read_body(socket, head, &mut memory).await);
     drop(permit);
     let request = attempt!(parse(&body));
     let request_bytes = body.len();
@@ -481,6 +493,21 @@ async fn handle(
     }
 }
 
+/// The refusal of a request the gateway has no memory for: before anything was sent.
+fn memory_refused() -> Refused {
+    refused(
+        "memory_capacity",
+        "53300",
+        "gateway has no memory for the request",
+    )
+}
+
+/// The memory a request holds from its body on: the body, the statements parsed from it and the
+/// pipeline they become, which together take about three times the body.
+fn request_memory(body: usize) -> usize {
+    body.saturating_mul(3)
+}
+
 /// What a request presents: a v6 route that names the unit it runs on, or a v5 wake ticket that
 /// waits for the agent's release.
 enum Presented {
@@ -534,7 +561,11 @@ fn admitted_route(head: &HttpHead, gateway: &Gateway) -> Result<Presented, Refus
     Ok(presented)
 }
 /// The request body, by Content-Length or chunked. Every buffer that held it is zeroized.
-async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<Vec<u8>>, Refused> {
+async fn read_body(
+    socket: &mut TcpStream,
+    head: HttpHead,
+    memory: &mut Lease,
+) -> Result<Zeroizing<Vec<u8>>, Refused> {
     let HttpHead {
         headers,
         prefix,
@@ -585,6 +616,9 @@ async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<V
                     if &raw[start + size..start + size + 2] != b"\r\n" {
                         return Err(invalid("invalid request"));
                     }
+                    if !memory.grow(request_memory(size)) {
+                        return Err(memory_refused());
+                    }
                     body.extend_from_slice(&raw[start..start + size]);
                     offset = start + size + 2;
                 }
@@ -607,6 +641,10 @@ async fn read_body(socket: &mut TcpStream, head: HttpHead) -> Result<Zeroizing<V
     }
     if prefix.len() - end > length {
         return Err(invalid("invalid request"));
+    }
+    // Leased before the buffer exists: a body the database has no memory for is refused as sent.
+    if !memory.grow(request_memory(length)) {
+        return Err(memory_refused());
     }
     // Sized once: a reallocation would leave an unwiped copy behind.
     let mut body = Zeroizing::new(Vec::with_capacity(length));
@@ -751,7 +789,8 @@ async fn checkout(
             None => return Checkout::Missed(None),
         }
     };
-    let Ok(salted) = Salted::derive(password, newest.salt, newest.iterations).await else {
+    let derivation = Salted::derive(&claims.db, password, newest.salt, newest.iterations);
+    let Ok(salted) = derivation.await else {
         return Checkout::Missed(None);
     };
     let derived = salted.verifier();
@@ -800,9 +839,13 @@ async fn open(
     let capacity = || refused("admission_denied", "53300", "too many connections");
     let memory = transport::session_memory(gateway, database).ok_or_else(capacity)?;
     let wire = WireBudget::new(gateway.memory.lease(database));
+    let unauthenticated = gateway
+        .begin_authentication(database)
+        .map_err(|_| capacity())?;
     let (lease, actions) = gateway
         .reserve(claims, wire, target, false)
         .map_err(|_| capacity())?;
+    lease.hold_unauthenticated(unauthenticated);
     // The route was checked against this writer; a replacement is never dialled.
     gateway
         .dialable(database, target, true)
@@ -834,6 +877,7 @@ async fn open(
         user: claims.user.clone(),
         generation: claims.generation,
         verifier: None,
+        key: None,
         authenticated: Instant::now(),
         _memory: memory,
     };
@@ -849,6 +893,7 @@ async fn open(
         Ok(verifier) => {
             backend.verifier = verifier;
             backend.authenticated = Instant::now();
+            backend.lease.authenticated();
             gateway
                 .measurements
                 .lock()
@@ -899,7 +944,7 @@ async fn authenticate(
             Guard::Fenced => not_accepting("fenced"),
             Guard::Lost => failed(),
         })?;
-    let login = auth::login(&mut backend.postgres, password, known)
+    let login = auth::login(&mut backend.postgres, &backend.database, password, known)
         .await
         .map_err(|_| failed())?;
     let startup_error = |body: &[u8]| Refused {
@@ -924,14 +969,17 @@ async fn authenticate(
         match tag {
             b'E' => return Err(startup_error(body)),
             b'Z' if rest.is_empty() => return Ok(verifier),
-            b'R' | b'S' | b'K' | b'N' => {}
+            b'K' => backend.key = <[u8; 8]>::try_from(body).ok(),
+            b'R' | b'S' | b'N' => {}
             _ => return Err(protocol()),
         }
     }
     Err(protocol())
 }
 /// Writes to PostgreSQL only while the agent's table still admits new work for the session's
-/// database on its writer, holding the table for the bounded write.
+/// database on its writer; the table is not held while the write waits for PostgreSQL
+/// (`Gateway::write_admitted`). The session is marked busy before each call, which that function
+/// requires: `open` and `handle` mark it, and it stays so until the session is parked.
 async fn write_guarded(
     gateway: &Gateway,
     backend: &mut Backend,
@@ -944,7 +992,7 @@ async fn write_guarded(
         ..
     } = backend;
     gateway
-        .write_admitted(database, &lease.target, postgres, bytes)
+        .write_admitted(&lease.id, database, &lease.target, postgres, bytes)
         .await
         .map_err(|blocked| match blocked {
             Blocked::Fenced | Blocked::TargetChanged => Guard::Fenced,
@@ -1073,7 +1121,7 @@ impl Answer {
         if needed > capacity {
             let grown = needed.max(capacity * 2).min(MAX_RESPONSE_BYTES);
             if !self.memory.grow(grown - capacity) {
-                return Err(too_large());
+                return Err(unknown("memory_capacity"));
             }
             self.bytes.reserve_exact(grown - self.bytes.len());
         }
@@ -1174,6 +1222,26 @@ fn statement(out: &mut Vec<u8>, query: &str, params: &[Option<String>], describe
     }
     message(out, b'E', &[0, 0, 0, 0, 0]);
 }
+/// The CancelRequest that names a session's backend: its length, the cancel code and its key.
+fn cancel_packet(key: &[u8; 8]) -> [u8; 16] {
+    let mut packet = [0u8; 16];
+    packet[..4].copy_from_slice(&16u32.to_be_bytes());
+    packet[4..8].copy_from_slice(&80_877_102u32.to_be_bytes());
+    packet[8..].copy_from_slice(key);
+    packet
+}
+
+/// Asks PostgreSQL to cancel the statement a session runs, over a connection of its own. The
+/// caller ends the session: a stream that was cut off has lost its place in the protocol.
+async fn cancel(target: &Writer, key: Option<[u8; 8]>) {
+    // No key means the startup gave a BackendKeyData that is not eight bytes, which `authenticate`
+    // does not keep: the session cannot be named, so only its end is sent.
+    let Some(key) = key else { return };
+    if let Ok(Ok(mut stream)) = timeout(Duration::from_millis(500), local::dial(target)).await {
+        let _ = stream.write_all(&cancel_packet(&key)).await;
+    }
+}
+
 /// Runs the request as one pipeline ending in one Sync: a batch between BEGIN and COMMIT. The
 /// answer is the results or PostgreSQL's error, with the transaction status after the Sync; a
 /// refusal means the session cannot be used again.
@@ -1183,6 +1251,8 @@ async fn execute(
     statements: &[Statement],
     transaction: Option<&Transaction>,
 ) -> Result<(Result<Answer, Vec<u8>>, u8), Refused> {
+    // Taken here, so that no statement of the request can set a longer bound than the gateway's.
+    let deadline = tokio::time::Instant::now() + gateway.config.statement_bound;
     let mut pipeline = Vec::new();
     if let Some(transaction) = transaction {
         statement(&mut pipeline, &begin(transaction), &[], false);
@@ -1204,10 +1274,21 @@ async fn execute(
         transaction.is_some(),
     )?;
     let Backend {
-        postgres, actions, ..
+        postgres,
+        actions,
+        lease,
+        key,
+        ..
     } = backend;
+    let key = *key;
     tokio::select! {
-        result = results(postgres, answer) => result,
+        result = timeout_at(deadline, results(postgres, answer)) => match result {
+            Ok(result) => result,
+            Err(_) => {
+                cancel(&lease.target, key).await;
+                Err(unknown("statement_deadline"))
+            }
+        },
         _ = retired(actions) => Err(unknown("database_retired")),
     }
 }
@@ -1227,7 +1308,7 @@ async fn results(
         // Each message is leased while it is held.
         let held = body.len();
         if !answer.memory.grow(held) {
-            return Err(too_large());
+            return Err(unknown("memory_capacity"));
         }
         let step = match tag {
             b'1' | b'2' | b'3' | b'N' | b'S' | b'A' => Ok(()),
@@ -1413,7 +1494,7 @@ mod tests {
     }
     #[test]
     fn the_answer_leases_what_it_holds_and_refuses_beyond_its_bound() {
-        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024);
+        let budget = crate::budget::MemoryBudget::new(64 * 1024 * 1024, 32 * 1024 * 1024, 0, 0);
         let mut answer = Answer::new(budget.lease("db"), true).unwrap();
         answer.begin(&[json!({"name":"x"})]).unwrap();
         answer.row(&row(&[None, Some(b"a\"b\n")])).unwrap();
@@ -1445,14 +1526,15 @@ mod tests {
         );
         assert!(answer.bytes.len() <= MAX_RESPONSE_BYTES);
         assert_eq!(budget.database_used("db"), answer.bytes.capacity());
-        // The budget refuses before the bound does.
-        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024);
+        // The budget refuses before the bound does, and says so: the answer is not too large, the
+        // gateway has no memory for it.
+        let small = crate::budget::MemoryBudget::new(1024 * 1024, 1024 * 1024, 0, 0);
         let mut answer = Answer::new(small.lease("db"), false).unwrap();
         answer.begin(&[]).unwrap();
         let refused = (0..1_000_000).find_map(|_| answer.row(&null).err());
         assert_eq!(
             refused.map(|refusal| refusal.outcome),
-            Some("response_too_large")
+            Some("memory_capacity")
         );
         assert!(answer.bytes.capacity() <= 1024 * 1024);
     }
@@ -1495,5 +1577,45 @@ mod tests {
             error_fields(&body),
             json!({"severity":"ERROR","code":"23505","message":"duplicate key","detail":"Key (id)=(1) already exists.","constraint":"items_pkey"})
         );
+    }
+
+    #[test]
+    fn a_request_holds_three_times_its_body_from_its_database_budget() {
+        assert_eq!(request_memory(MAX_REQUEST_BYTES), 12 << 20);
+        let budget = crate::budget::MemoryBudget::new(64 << 20, 32 << 20, 0, 0);
+        let mut lease = budget.lease("db");
+        assert!(lease.grow(request_memory(MAX_REQUEST_BYTES)));
+        assert_eq!(budget.database_used("db"), 12 << 20);
+        // A second request of the same size would take the database past its share of the budget.
+        assert!(!lease.grow(request_memory(MAX_REQUEST_BYTES) * 2));
+    }
+
+    #[test]
+    fn the_cancel_request_names_the_backend_by_its_key() {
+        assert_eq!(
+            cancel_packet(&[0, 0, 0, 7, 0, 0, 0, 9]),
+            [0, 0, 0, 16, 4, 210, 22, 46, 0, 0, 0, 7, 0, 0, 0, 9]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_the_database_has_no_memory_for_is_refused_before_it_is_read() {
+        let budget = crate::budget::MemoryBudget::new(64 << 20, 1 << 20, 0, 0);
+        let mut memory = budget.lease("db");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (_client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (mut socket, _) = accepted.unwrap();
+        let head = HttpHead {
+            method: "POST".into(),
+            path: "/sql".into(),
+            headers: vec![("content-length".into(), (1 << 20).to_string())],
+            prefix: Vec::new(),
+            end: 0,
+        };
+        // The client sends no body: the refusal comes before the reader waits for one.
+        let answer = read_body(&mut socket, head, &mut memory).await.unwrap_err();
+        assert_eq!(answer.outcome, "memory_capacity");
+        assert_eq!(budget.database_used("db"), 0);
     }
 }

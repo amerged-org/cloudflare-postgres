@@ -64,11 +64,14 @@ describe("the technical volume bound of a node (plan 4.8, 4.11)", () => {
 
   it("takes the next node when the fullest one is at the bound", async () => {
     const f = await fixture(4096);
-    // Fuller than the other node, so only the bound keeps it from winning.
     await report(f.node, 1000, OPEN_POOL, 300_000);
     const other = await addNode(f.region, 4096);
     await report(other, 10);
-    const nodes = await placementNodes(env.DB, f.region, Date.now());
+    // More memory placed on it, so only the bound keeps it from winning, whichever id is lower.
+    const nodes = (await placementNodes(env.DB, f.region, Date.now())).map(
+      (node) =>
+        node.id === f.node ? { ...node, placed_memory_mib: 1024 } : node,
+    );
     expect(choosePlacement(nodes, SMALL)?.id).toBe(other);
   });
 

@@ -618,18 +618,19 @@ impl<R: CommandRunner + Send + Sync + 'static> Host for System<R> {
         };
         let (mut locked, mut postmaster) = (false, None);
         if let [(database, _)] = databases.as_slice() {
-            // The process's own view of the data directory, which needs no mount of the agent's.
-            let data = PathBuf::from(format!(
+            // The process's own view of the volume, which needs no mount of the agent's.
+            let volume = PathBuf::from(format!(
                 "/proc/{pid}/root{}",
-                self.layout.data(database).display()
+                self.layout.volume(database).display()
             ));
+            let data = volume.join("data");
             if let (Ok(metadata), Ok(table)) = (
                 std::fs::metadata(&data),
                 std::fs::read_to_string("/proc/locks"),
             ) {
                 locked = holds_lock(pid, &metadata, &table);
             }
-            postmaster = std::fs::read_to_string(data.join("postmaster.pid"))
+            postmaster = ready::read(&volume)
                 .ok()
                 .and_then(|text| ready::parse(&text).ok())
                 .filter(|postmaster| postmaster.pid == pid)

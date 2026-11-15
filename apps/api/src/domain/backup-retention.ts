@@ -8,8 +8,21 @@ import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 import { retireColdSnapshots } from "./cold-snapshot-retention.ts";
-import { BACKUP_DATA, keysOf, walRangeArchived } from "./archive-chain.ts";
 import {
+  digestMismatch,
+  recordedDigests,
+  verifyBackupDigest,
+  type ArchiveDigests,
+} from "./archive-digests.ts";
+import { backfillBackupDigests } from "./archive-digest-backfill.ts";
+import {
+  BACKUP_DATA,
+  keysOf,
+  objectsOf,
+  walRangeArchived,
+} from "./archive-chain.ts";
+import {
+  fencedAtSql,
   parseBackupInfo,
   readRestoreCatalog,
   type RestoreBackup,
@@ -29,10 +42,11 @@ import {
  * so the catalog never offers a backup whose data is half gone; data left behind by an
  * interrupted run is deleted by the next one, because it lies before the anchor too.
  *
- * The anchor comes from the restore catalog. An archive beyond the catalog's bounds (more than 64
- * base backups, or more than 16,000 objects) is not left to grow: its anchor is then found without
- * reading it whole, from the newest few backups that ended before the window, and is accepted when
- * its data and its own range of WAL are archived. The catalog's further rule, that WAL of a later
+ * The anchor comes from the restore catalog, and only a backup that R2 says was uploaded by the
+ * cutoff can be one: a descriptor a node writes now, whatever it says, is never the anchor. An
+ * archive beyond the catalog's bounds (more than 64 base backups, or more than 16,000 objects) is
+ * not left to grow: its anchor is then found without reading it whole, from the newest few backups
+ * that ended before the window, and is accepted when its data and its own range of WAL are archived. The catalog's further rule, that WAL of a later
  * timeline needs a backup of its own, is not applied there: the window needs nothing older than
  * the anchor either way. Old WAL is listed from the start and only as far as one run deletes.
  *
@@ -85,20 +99,32 @@ async function boundedAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
+  recorded: ArchiveDigests,
 ): Promise<RestoreBackup | null> {
   const described: string[] = [],
-    withData = new Set<string>();
-  for await (const key of keysOf(bucket, `${prefix}base/`)) {
-    const base = BASE.exec(key.slice(prefix.length));
+    withData = new Set<string>(),
+    uploaded = new Map<string, number>();
+  for await (const object of objectsOf(bucket, `${prefix}base/`)) {
+    const base = BASE.exec(object.key.slice(prefix.length));
     if (!base) continue;
-    if (key.endsWith("/backup.info")) described.push(base[1]!);
-    else if (BACKUP_DATA.test(key)) withData.add(base[1]!);
+    uploaded.set(
+      base[1]!,
+      Math.max(uploaded.get(base[1]!) ?? 0, object.uploaded.getTime()),
+    );
+    if (object.key.endsWith("/backup.info")) described.push(base[1]!);
+    else if (BACKUP_DATA.test(object.key)) withData.add(base[1]!);
   }
   let reads = 0;
   for (const id of described.sort().reverse()) {
     // A backup that began a day after the cutoff did not end before it, whatever the node's clock.
     if (idMs(id) > cutoff + 86_400_000) continue;
+    // Once the archive is enforced, only a backup whose digest the Worker recorded is trusted; one that
+    // changed fails the pass.
+    const expected = recorded.recorded.get(id);
+    if (recorded.enforced && expected === undefined) continue;
     if (reads++ === ANCHOR_READS) break;
+    if (expected !== undefined)
+      await verifyBackupDigest(bucket, prefix, id, expected);
     const info = await bucket.get(`${prefix}base/${id}/backup.info`);
     const backup =
       info && info.size <= 65536
@@ -107,6 +133,7 @@ async function boundedAnchor(
     if (
       backup &&
       Date.parse(backup.end) <= cutoff &&
+      (uploaded.get(id) ?? Infinity) <= cutoff &&
       withData.has(id) &&
       (await walRangeArchived(bucket, prefix, {
         first: backup.beginWal,
@@ -123,11 +150,24 @@ async function findAnchor(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
+  notAfter: string | undefined,
+  recorded: ArchiveDigests,
 ): Promise<RestoreBackup | null> {
   try {
+    const catalog = await readRestoreCatalog(
+      bucket,
+      prefix,
+      notAfter,
+      recorded,
+    );
+    // Retention deletes nothing while a recorded backup no longer matches: the pass fails instead.
+    if (catalog.mismatched.length > 0) throw digestMismatch();
     return (
-      (await readRestoreCatalog(bucket, prefix)).backups.find(
-        (backup) => Date.parse(backup.end) <= cutoff,
+      catalog.backups.find(
+        (backup) =>
+          Date.parse(backup.end) <= cutoff &&
+          idMs(backup.id) <= cutoff + 86_400_000 &&
+          (catalog.uploaded.get(backup.id) ?? Infinity) <= cutoff,
       ) ?? null
     );
   } catch (error) {
@@ -135,7 +175,7 @@ async function findAnchor(
       error instanceof ApiError && error.details?.reason === "archive_unusable"
     ))
       throw error;
-    return boundedAnchor(bucket, prefix, cutoff);
+    return boundedAnchor(bucket, prefix, cutoff, recorded);
   }
 }
 
@@ -148,9 +188,18 @@ export async function retainBackups(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  maxDeletes = DEFAULT_DELETES_PER_DATABASE,
+  maxDeletes: number,
+  notAfter: string | undefined,
+  recorded: ArchiveDigests,
 ): Promise<RetentionResult> {
-  const plan = await retentionPlan(bucket, prefix, cutoff, maxDeletes);
+  const plan = await retentionPlan(
+    bucket,
+    prefix,
+    cutoff,
+    maxDeletes,
+    notAfter,
+    recorded,
+  );
   await deleteKeys(bucket, plan.descriptors);
   await deleteKeys(bucket, plan.data);
   return plan.result;
@@ -160,9 +209,11 @@ async function retentionPlan(
   bucket: R2Bucket,
   prefix: string,
   cutoff: number,
-  maxDeletes = DEFAULT_DELETES_PER_DATABASE,
+  maxDeletes: number,
+  notAfter: string | undefined,
+  recorded: ArchiveDigests,
 ): Promise<{ descriptors: string[]; data: string[]; result: RetentionResult }> {
-  const anchor = await findAnchor(bucket, prefix, cutoff);
+  const anchor = await findAnchor(bucket, prefix, cutoff, notAfter, recorded);
   if (!anchor)
     return {
       descriptors: [],
@@ -214,6 +265,7 @@ interface DueRow {
   archive_path: string;
   storage_generation: number;
   backup_retention_days: number;
+  fenced_at: string | null;
 }
 export interface RetentionRun {
   checked: number;
@@ -236,14 +288,19 @@ export async function enforceBackupRetention(
   limit = 2,
 ): Promise<RetentionRun> {
   const at = new Date(now).toISOString();
+  // An archive that names another bucket is out of this Worker's reach and is never selected, so it
+  // cannot fill the batch of two.
+  const named = `s3://${archiveBucket(env).bucketName}/`;
   const due = (
     await env.DB.prepare(
-      `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,s.backup_retention_days
+      `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,s.backup_retention_days,${fencedAtSql("d.node_id")} AS fenced_at
       FROM databases d JOIN size_classes s ON s.id=d.size_class_id
       LEFT JOIN backup_retention_runs c ON c.database_id=d.id AND c.archive_path=d.archive_path
       LEFT JOIN database_recovery_points p ON p.database_id=d.id AND p.storage_generation=d.storage_generation
       WHERE d.node_id IS NOT NULL AND d.deleted_at IS NULL AND d.desired_state<>'deleted'
       AND NOT EXISTS(SELECT 1 FROM archive_pins pin WHERE pin.archive_path=d.archive_path AND pin.released_at IS NULL)
+      AND NOT EXISTS(SELECT 1 FROM node_losses l WHERE l.node_id=d.node_id AND l.powered_off_at IS NULL)
+      AND substr(d.archive_path,1,length(?))=?
       AND NOT EXISTS(SELECT 1 FROM database_replacements rp WHERE rp.database_id=d.id AND rp.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id
         WHERE x.source_database_id=d.id AND x.verified_at IS NULL AND o.status IN('pending','running'))
@@ -251,15 +308,23 @@ export async function enforceBackupRetention(
         OR json_extract(p.backup_json,'$.completed_at')>c.checked_at)
       ORDER BY c.checked_at IS NOT NULL,c.checked_at,d.id LIMIT ?`,
     )
-      .bind(new Date(now - RECHECK_MS).toISOString(), limit)
+      .bind(named, named, new Date(now - RECHECK_MS).toISOString(), limit)
       .all<DueRow>()
   ).results;
   const run: RetentionRun = { checked: 0, backups: 0, objects: 0, failed: 0 };
+  const recordCheck = (row: DueRow, backups: number, objects: number) =>
+    env.DB.prepare(
+      `INSERT INTO backup_retention_runs(database_id,archive_path,checked_at,backups_deleted,objects_deleted) VALUES(?,?,?,?,?)
+      ON CONFLICT(database_id) DO UPDATE SET archive_path=excluded.archive_path,checked_at=excluded.checked_at,backups_deleted=excluded.backups_deleted,objects_deleted=excluded.objects_deleted`,
+    )
+      .bind(row.id, row.archive_path, at, backups, objects)
+      .run();
   for (const row of due) {
     run.checked++;
     try {
       const selected = archiveBucket(env),
-        prefix = validatedArchivePrefix(row, selected.bucketName);
+        prefix = validatedArchivePrefix(row, selected.bucketName),
+        recorded = await recordedDigests(env.DB, row.archive_path);
       const deletion = await deleteUnpinnedArchiveKeys(
         env,
         selected.bucket,
@@ -270,6 +335,9 @@ export async function enforceBackupRetention(
             selected.bucket,
             prefix,
             now - row.backup_retention_days * 86_400_000,
+            DEFAULT_DELETES_PER_DATABASE,
+            row.fenced_at ?? undefined,
+            recorded,
           );
           return {
             keys: [...plan.descriptors, ...plan.data],
@@ -288,12 +356,7 @@ export async function enforceBackupRetention(
       run.backups += result.backups;
       run.objects += result.objects;
       if (result.complete)
-        await env.DB.prepare(
-          `INSERT INTO backup_retention_runs(database_id,archive_path,checked_at,backups_deleted,objects_deleted) VALUES(?,?,?,?,?)
-          ON CONFLICT(database_id) DO UPDATE SET archive_path=excluded.archive_path,checked_at=excluded.checked_at,backups_deleted=excluded.backups_deleted,objects_deleted=excluded.objects_deleted`,
-        )
-          .bind(row.id, row.archive_path, at, result.backups, result.objects)
-          .run();
+        await recordCheck(row, result.backups, result.objects);
     } catch (error) {
       run.failed++;
       console.error(
@@ -307,6 +370,9 @@ export async function enforceBackupRetention(
               : "retention_failed",
         }),
       );
+      // A check without counts sends an archive that throws to the back for the recheck interval; if the
+      // write fails too, the row is simply due again next minute.
+      await recordCheck(row, 0, 0).catch(() => undefined);
     }
   }
   return run;
@@ -496,6 +562,9 @@ export async function expireColdStorageArchives(
 export async function runBackupRetention(env: Env, now: number): Promise<void> {
   let failed = 0;
   for (const part of [
+    // Before the enforcement: an archive written before digests were recorded is enforced only once its
+    // backups are recorded here or it is marked done.
+    async () => (await backfillBackupDigests(env, now), 0),
     async () => (await enforceBackupRetention(env, now)).failed,
     async () => (await expireSupersededArchives(env, now), 0),
     async () => (await expireColdStorageArchives(env, now), 0),

@@ -84,11 +84,11 @@ pub struct Config {
     /// The LVM metadata area of the physical volume: about 95,000 volumes (Stage 1).
     pub pv_metadata_bytes: u64,
     pub pool_metadata_bytes: u64,
-    /// The node's own ceiling: the sum of nominal volume sizes stays at or below this many times
-    /// the pool's data size (plan 4.3's default). It is not part of the node policy on the link,
-    /// so the cap Cloudflare enforces when it places a database or accepts a resize must not
-    /// exceed it, or the node refuses what Cloudflare accepted.
-    pub logical_cap_factor: u64,
+    /// The node's own ceiling: the sum of nominal volume sizes stays at or below this percentage of
+    /// the pool's data size (plan 4.3: 150 %). It is not part of the node policy on the link, so the
+    /// cap Cloudflare enforces when it places a database or accepts a resize must not exceed it, or
+    /// the node refuses what Cloudflare accepted.
+    pub logical_cap_percent: u64,
 }
 
 impl Default for Config {
@@ -101,7 +101,7 @@ impl Default for Config {
             device_links: PathBuf::from(DEVICE_LINKS),
             pv_metadata_bytes: 64 << 20,
             pool_metadata_bytes: 1 << 30,
-            logical_cap_factor: 4,
+            logical_cap_percent: 150,
         }
     }
 }

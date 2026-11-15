@@ -75,6 +75,9 @@ impl Front {
             },
             maximum_memory: 192 << 20,
             database_memory: 96 << 20,
+            reserve_memory: 96 << 20,
+            guaranteed_memory: 3 << 20,
+            statement_bound: pgcf_native_gateway::sql::STATEMENT_BOUND,
         }));
         let (stop, receiver) = watch::channel(false);
         let channel = tokio::spawn(local::synchronize(

@@ -301,7 +301,7 @@ describe("resources of a database", () => {
     expect((await put(f, id, own({ cpu_millicores: 750 }))).status).toBe(202);
   });
 
-  /** The fixture's node reports a 30 GiB pool (cap 120 GiB) with `soldGib` GiB sold. */
+  /** The fixture's node reports a 30 GiB pool (cap 45 GiB) with `soldGib` GiB sold. */
   const sold = (f: Fixture, soldGib: number) =>
     seedSamples(
       f.node,
@@ -318,11 +318,11 @@ describe("resources of a database", () => {
   it("holds the storage growth of an awake database to the node's logical cap, counting the growth still open", async () => {
     const f = await fixture(16384);
     const id = await ready(f);
-    await sold(f, 112);
-    // 112 GiB and 5 GiB more are under the cap of 120 GiB.
+    await sold(f, 40);
+    // 40 GiB and 5 GiB more reach the cap of 45 GiB exactly.
     expect((await put(f, id, own({ storage_gib: 10 }))).status).toBe(202);
     await applied(f, id, 2);
-    // The node has not reported the volume yet: 112 GiB, the 10 GiB in flight and 5 GiB more pass it.
+    // The node has not reported the volume yet: the 5 GiB in flight and 5 GiB more pass the cap.
     expect(
       await refusal(await put(f, id, own({ storage_gib: 15 }))),
     ).toMatchObject({
@@ -375,11 +375,11 @@ describe("storage growth of a database that sleeps", () => {
           ...OPEN_POOL,
           dataTotal: 30 * GIB,
           dataUsed: 0,
-          nominal: 100 * GIB,
+          nominal: 30 * GIB,
         },
       }),
     );
-    // The cap is 120 GiB: 100 GiB sold, so 60,000 GiB are refused and 8 GiB are not.
+    // The cap is 45 GiB: 30 GiB sold, so 60,000 GiB are refused and 8 GiB are not.
     expect(
       await refusal(await put(f, id, own({ storage_gib: 60000 }))),
     ).toMatchObject({

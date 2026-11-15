@@ -7,16 +7,24 @@
 //!
 //! The gateway's one SCRAM client accepts a PostgreSQL that proves the password's verifier, or one
 //! that asks for no password; any other request (a cleartext or MD5 password) never receives it.
-//! Its PBKDF2 runs off the async workers, a bounded number at once, for at most
-//! [`MAXIMUM_ITERATIONS`].
+//! Its PBKDF2 runs off the async workers, at most two derivations at once node-wide, and at most one
+//! for each database: no database can hold both slots, so another database's login always finds
+//! one. One login costs its verifier's iteration count in HMAC rounds, once per derivation, so a
+//! verifier may ask for at most [`MAXIMUM_ITERATIONS`].
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use pgcf_native_protocol::{constant, startup::error_response};
 use ring::rand::SecureRandom;
 use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex, Weak},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::Semaphore,
+    time::timeout,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -26,11 +34,31 @@ type Failure = Box<dyn std::error::Error + Send + Sync>;
 pub const CLEARTEXT_REQUEST: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
 /// The longest message PostgreSQL may send while the gateway logs in for the client.
 const MAXIMUM_MESSAGE: usize = 64 * 1024;
-/// The most PBKDF2 iterations a PostgreSQL verifier may ask for: 25 times PostgreSQL's default
-/// (4096), so no role's verifier makes a login cost the gateway more than milliseconds of CPU.
-pub const MAXIMUM_ITERATIONS: u32 = 100_000;
+/// The most PBKDF2 iterations a PostgreSQL verifier may ask for: 4 times the 4096 that PostgreSQL
+/// and the node agent write (`ITERATIONS` in apps/node-agent/src/scram.rs). A tenant may set its
+/// own verifier, and each login it causes holds one of the two derivation slots for this many
+/// rounds, so the bound shortens how long one role can hold a slot and delay the other logins; it
+/// does not give a database a slot of its own.
+pub const MAXIMUM_ITERATIONS: u32 = 16_384;
 /// The PBKDF2 derivations that run at once, on blocking threads.
 static DERIVATIONS: Semaphore = Semaphore::const_new(2);
+/// How long a derivation waits for its database's share or a node slot before its login is refused.
+const DERIVATION_WAIT: Duration = Duration::from_secs(5);
+/// The derivation share of each database that has one: a single slot, so a database never holds
+/// both of the node's. Entries whose share is no longer held are dropped as the next is taken.
+static SHARES: LazyLock<Mutex<HashMap<String, Weak<Semaphore>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn share_of(database: &str) -> Arc<Semaphore> {
+    let mut shares = SHARES.lock().unwrap();
+    shares.retain(|_, share| share.strong_count() > 0);
+    if let Some(share) = shares.get(database).and_then(|share| share.upgrade()) {
+        return share;
+    }
+    let share = Arc::new(Semaphore::new(1));
+    shares.insert(database.to_owned(), Arc::downgrade(&share));
+    share
+}
 
 /// What a client pipelined behind its StartupMessage, in the message of the StartupMessage.
 #[derive(Debug)]
@@ -139,8 +167,10 @@ pub struct Salted {
     key: Zeroizing<[u8; 32]>,
 }
 impl Salted {
-    /// Derives it on a blocking thread, at most [`DERIVATIONS`] at once.
+    /// Derives it on a blocking thread, holding one of the database's shares and one node slot,
+    /// each for at most [`DERIVATION_WAIT`] to be taken.
     pub async fn derive(
+        database: &str,
         password: &Password,
         salt: Vec<u8>,
         iterations: u32,
@@ -148,11 +178,18 @@ impl Salted {
         if salt.is_empty() || !(1..=MAXIMUM_ITERATIONS).contains(&iterations) {
             return Err("invalid SCRAM salt or iteration count".into());
         }
-        // The permit moves with the work, so a cancelled login still bounds what runs.
-        let permit = DERIVATIONS.acquire().await?;
+        // The permits move with the work, so a cancelled login still bounds what runs.
+        let share = timeout(DERIVATION_WAIT, share_of(database).acquire_owned())
+            .await
+            .map_err(|_| "derivation share busy")?
+            .map_err(|_| "derivation share closed")?;
+        let permit = timeout(DERIVATION_WAIT, DERIVATIONS.acquire())
+            .await
+            .map_err(|_| "derivation capacity busy")??;
         let password = password.0.clone();
         let (salt, key) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _share = share;
             let key = salted_password(&password, &salt, iterations);
             (salt, key)
         })
@@ -215,9 +252,11 @@ impl std::fmt::Debug for Verifier {
 
 /// Logs in to PostgreSQL, whose StartupMessage was written, with the client's password. Only a
 /// PostgreSQL that proves it holds the password's verifier is trusted with the session. `known`,
-/// derived for the same password, is used when PostgreSQL asks for its salt and iterations.
+/// derived for the same password, is used when PostgreSQL asks for its salt and iterations. The
+/// derivation share is the database's.
 pub async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     postgres: &mut S,
+    database: &str,
     password: &Password,
     known: Option<Salted>,
 ) -> Result<Login, Failure> {
@@ -225,11 +264,19 @@ pub async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     ring::rand::SystemRandom::new()
         .fill(&mut random)
         .map_err(|_| "random source unavailable")?;
-    login_with(postgres, password, &STANDARD.encode(random), known).await
+    login_with(
+        postgres,
+        database,
+        password,
+        &STANDARD.encode(random),
+        known,
+    )
+    .await
 }
 
 async fn login_with<S: AsyncRead + AsyncWrite + Unpin>(
     postgres: &mut S,
+    database: &str,
     password: &Password,
     nonce: &str,
     mut known: Option<Salted>,
@@ -275,7 +322,7 @@ async fn login_with<S: AsyncRead + AsyncWrite + Unpin>(
                 let (salt, iterations) = started.server_first(data)?;
                 let salted = match known.take() {
                     Some(known) if known.salt == salt && known.iterations == iterations => known,
-                    _ => Salted::derive(password, salt, iterations).await?,
+                    _ => Salted::derive(database, password, salt, iterations).await?,
                 };
                 let response = started.client_final(&salted, data);
                 postgres.write_all(&response).await?;
@@ -492,7 +539,7 @@ mod tests {
     }
     async fn continue_with(scram: &mut Scram, value: &[u8], server_first: &[u8]) -> Vec<u8> {
         let (salt, iterations) = scram.server_first(server_first).unwrap();
-        let salted = Salted::derive(&password(value), salt, iterations)
+        let salted = Salted::derive("db", &password(value), salt, iterations)
             .await
             .unwrap();
         scram.client_final(&salted, server_first)
@@ -531,7 +578,7 @@ mod tests {
             "r=otherserver,s=c2FsdA==,i=4096",
             "r=clientserver,s=,i=4096",
             "r=clientserver,s=c2FsdA==,i=0",
-            "r=clientserver,s=c2FsdA==,i=100001",
+            "r=clientserver,s=c2FsdA==,i=16385",
             "r=clientserver,s=c2FsdA==,i=4096,m=extension",
             "r=client server,s=c2FsdA==,i=4096",
         ] {
@@ -544,32 +591,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_verifier_is_accepted_up_to_the_maximum_iterations_and_refused_above_it() {
+        for iterations in [4_096, 16_384] {
+            let server_first = format!("r=clientserver,s=c2FsdA==,i={iterations}");
+            let (_, accepted) = Scram::new("client")
+                .server_first(server_first.as_bytes())
+                .unwrap();
+            assert_eq!(accepted, iterations);
+        }
+        for iterations in [16_385, 100_000] {
+            let server_first = format!("r=clientserver,s=c2FsdA==,i={iterations}");
+            let refused = Scram::new("client")
+                .server_first(server_first.as_bytes())
+                .unwrap_err();
+            assert_eq!(refused.to_string(), "invalid SCRAM iteration count");
+            assert!(
+                Salted::derive("db", &password(b"pencil"), b"salt".to_vec(), iterations)
+                    .await
+                    .is_err(),
+                "{iterations}"
+            );
+        }
+    }
+
     #[test]
     fn pbkdf2_runs_off_the_async_workers() {
-        // One worker thread: a derivation on it would stop the ticker until it ends.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering::SeqCst},
+        };
+        // One worker thread: a derivation on it would stop the ticker until it ends, so the widest
+        // stretch without a tick, the one still running at the end included, is the whole derivation.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         runtime.block_on(async {
-            let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let counted = ticks.clone();
+            let started = std::time::Instant::now();
+            let (last, widest) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let (tick, gap) = (last.clone(), widest.clone());
             let ticker = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let now = started.elapsed().as_micros() as u64;
+                    gap.fetch_max(now - tick.swap(now, SeqCst), SeqCst);
                 }
             });
-            let started = std::time::Instant::now();
-            Salted::derive(&password(b"pencil"), b"salt".to_vec(), MAXIMUM_ITERATIONS)
-                .await
-                .unwrap();
-            let elapsed = started.elapsed();
+            Salted::derive(
+                "db",
+                &password(b"pencil"),
+                b"salt".to_vec(),
+                MAXIMUM_ITERATIONS,
+            )
+            .await
+            .unwrap();
+            let elapsed = started.elapsed().as_micros() as u64;
             ticker.abort();
-            let ticks = ticks.load(std::sync::atomic::Ordering::SeqCst);
+            let widest = widest.load(SeqCst).max(elapsed - last.load(SeqCst));
             assert!(
-                elapsed.as_millis() < 10 || ticks as u128 >= elapsed.as_millis() / 4,
-                "{ticks} ticks in {elapsed:?}"
+                elapsed < 10_000 || widest * 2 < elapsed,
+                "{widest} us without a tick in {elapsed} us"
             );
         });
     }
@@ -578,7 +660,7 @@ mod tests {
     async fn a_known_salted_password_for_the_same_salt_and_iterations_is_not_derived_again() {
         let salt = STANDARD.decode("W22ZaJ0SNY7soEsUEjb6gQ==").unwrap();
         // Derived from the RFC's password: the proof shows it was used for this one.
-        let known = Salted::derive(&password(b"pencil"), salt.clone(), 4096)
+        let known = Salted::derive("db", &password(b"pencil"), salt.clone(), 4096)
             .await
             .unwrap();
         let mut scram = Scram::for_user("user", "rOprNGfwEbeRWgbNEkqO");
@@ -587,12 +669,12 @@ mod tests {
         assert!(known.verifier().same(&known.verifier()));
         let response = scram.client_final(&known, SERVER_FIRST);
         assert!(response.ends_with(b"p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="));
-        let other = Salted::derive(&password(b"pencil2"), known.salt.clone(), 4096)
+        let other = Salted::derive("db", &password(b"pencil2"), known.salt.clone(), 4096)
             .await
             .unwrap();
         assert!(!known.verifier().same(&other.verifier()));
         assert!(
-            Salted::derive(&password(b"pencil"), Vec::new(), 4096)
+            Salted::derive("db", &password(b"pencil"), Vec::new(), 4096)
                 .await
                 .is_err()
         );
@@ -681,6 +763,7 @@ mod tests {
         });
         let login = login_with(
             &mut gateway,
+            "db",
             &password(b"pencil"),
             "rOprNGfwEbeRWgbNEkqO",
             None,
@@ -734,7 +817,7 @@ mod tests {
             panic!("not authenticated with a verifier");
         };
         assert_eq!(answer, ready);
-        let expected = Salted::derive(&password(b"pencil"), salt, 4096)
+        let expected = Salted::derive("db", &password(b"pencil"), salt, 4096)
             .await
             .unwrap();
         assert!(verifier.same(&expected.verifier()));
@@ -752,5 +835,29 @@ mod tests {
         let (login, written) = exchange(vec![frame(b'R', b"\0\0\0\x0aOTHER\0\0")]).await;
         assert!(login.is_err());
         assert!(written.is_empty());
+    }
+
+    #[test]
+    fn one_database_never_holds_both_derivation_slots() {
+        let held = share_of("share-test-a").try_acquire_owned().unwrap();
+        assert!(share_of("share-test-a").try_acquire_owned().is_err());
+        assert!(share_of("share-test-b").try_acquire_owned().is_ok());
+        drop(held);
+        assert!(share_of("share-test-a").try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_database_whose_share_stays_busy_is_refused_instead_of_queued() {
+        let _held = share_of("share-test-busy").acquire_owned().await.unwrap();
+        assert!(
+            Salted::derive(
+                "share-test-busy",
+                &password(b"pencil"),
+                b"salt".to_vec(),
+                4096
+            )
+            .await
+            .is_err()
+        );
     }
 }

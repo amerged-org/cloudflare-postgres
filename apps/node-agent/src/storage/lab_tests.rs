@@ -741,7 +741,7 @@ fn creating_again_never_formats_again_and_a_stopped_create_continues() {
 #[test]
 fn creating_is_refused_without_room_and_past_the_logical_cap() {
     let lab = Lab::open(256);
-    // The pool is about 170 MiB: the cap of 4 x pool is below 1 GiB.
+    // The pool is about 170 MiB: the cap of 150 % of the pool is below 1 GiB.
     let big = id(ID, 1);
     let result = lab.storage.create_volume(&big, 1 << 30, &policy());
     assert!(
@@ -2240,7 +2240,7 @@ fn tenant(command: &mut Command) -> &mut Command {
 /// An older filesystem with resize_inode and an 8 MiB journal grows safely offline.
 #[test]
 fn an_older_filesystem_grows_offline_without_losing_data() {
-    let lab = Lab::open_with(3072, |config| config.logical_cap_factor = 64);
+    let lab = Lab::open_with(3072, |config| config.logical_cap_percent = 6400);
     let a = id(ID, 1);
     let size = 8u64 << 30;
     lab.run(commands::volume_create(lab.config(), &a, size));
@@ -2304,7 +2304,7 @@ fn an_older_filesystem_grows_offline_without_losing_data() {
 #[test]
 fn a_volume_grows_online_under_a_running_postgresql_in_one_call_and_in_steps() {
     // The sold storage of the lab is far over its pool: the logical cap is lifted.
-    let lab = Lab::open_with(3072, |config| config.logical_cap_factor = 1 << 20);
+    let lab = Lab::open_with(3072, |config| config.logical_cap_percent = 100 << 20);
     let (one_call, steps) = (id(ID, 1), id(OTHER, 1));
     let gap = commands::FS_END_GAP_BYTES;
     for (volume, start_gib) in [(&one_call, 1u64), (&steps, 2u64)] {

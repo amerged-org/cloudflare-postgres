@@ -9,6 +9,9 @@ import {
 import { progressReplacements } from "./database-replacements.ts";
 import { isNodeFenced, recordOrderResults } from "./lifecycle-orders.ts";
 import { hintNode } from "./node-hints.ts";
+import { archiveBucket } from "./archive-bucket.ts";
+import { validatedArchivePrefix } from "./archive.ts";
+import { recordBackupDigest } from "./archive-digests.ts";
 
 /**
  * What the lifecycle takes from a node's observation report (`POST /node/v1/observations`): the
@@ -41,7 +44,83 @@ export async function applyLifecycleObservations(
   await progressReplacements(env, nodeId, report, now);
   await progressMoves(env, nodeId, report, now);
   await recordRecoveryPoints(env.DB, nodeId, report, now);
+  await recordReportedBackups(env, nodeId, report, now);
   return taken;
+}
+
+/**
+ * The Worker records the digest of each base backup a node reports done, the first time it reports it,
+ * from the archive as it stands then: recovery and retention trust only a backup that still matches.
+ * A backup it cannot record (its descriptor is not there yet, or its listing is incomplete) is
+ * reported again with the next report, and stays untrusted until then.
+ */
+async function recordReportedBackups(
+  env: Env,
+  nodeId: string,
+  report: NodeObservationReport,
+  now: number,
+): Promise<void> {
+  const selected = archiveBucket(env);
+  const reported = report.databases.flatMap((observed) =>
+    observed.state === "deleted" || observed.backup === null
+      ? []
+      : [
+          {
+            id: observed.id,
+            storage_generation: observed.storage_generation,
+            backup_id: observed.backup.backup_id,
+          },
+        ],
+  );
+  if (reported.length === 0) return;
+  const rows = await env.DB.batch<{
+    id: string;
+    region_id: string;
+    archive_path: string;
+    storage_generation: number;
+    backup_id: string;
+    recorded: number;
+  }>(
+    reported.map((entry) =>
+      env.DB.prepare(
+        `SELECT d.id,d.region_id,d.archive_path,d.storage_generation,? AS backup_id,
+          EXISTS(SELECT 1 FROM archive_backup_digests g WHERE g.archive_path=d.archive_path AND g.backup_id=?) AS recorded
+        FROM databases d WHERE d.id=? AND d.node_id=? AND d.storage_generation=?`,
+      ).bind(
+        entry.backup_id,
+        entry.backup_id,
+        entry.id,
+        nodeId,
+        entry.storage_generation,
+      ),
+    ),
+  );
+  for (const result of rows)
+    for (const row of result.results) {
+      if (row.recorded === 1) continue;
+      try {
+        await recordBackupDigest(
+          selected.bucket,
+          env.DB,
+          row.archive_path,
+          validatedArchivePrefix(row, selected.bucketName),
+          row.backup_id,
+          now,
+        );
+      } catch (error) {
+        console.error(
+          JSON.stringify({
+            event: "backup_digest_not_recorded",
+            database_id: row.id,
+            error_code:
+              error instanceof Error &&
+              /^[a-z][a-z0-9_]{2,63}$/.test(error.message)
+                ? error.message
+                : "digest_unrecorded",
+          }),
+        );
+      }
+    }
 }
 
 /**

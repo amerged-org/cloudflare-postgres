@@ -1711,28 +1711,25 @@ impl Machine for Local {
         Ok(packages)
     }
 
-    /// Apt's effect on the package list: the versions named are installed. A package file is only
-    /// recorded: the lock of a release lists the package of each file among its packages too, so
-    /// the versions already name it.
+    /// Apt's effect on the package list: each file `<name>_<version>.deb` is installed at its
+    /// version.
     async fn install_packages(
         &self,
         snapshot: &str,
-        versions: &[String],
         files: &[std::path::PathBuf],
     ) -> io::Result<()> {
         let mut state = self.state();
-        let names: Vec<_> = files
+        let names: Vec<String> = files
             .iter()
-            .filter_map(|file| file.file_name()?.to_str().map(String::from))
+            .filter_map(|file| Some(file.file_name()?.to_str()?.to_string()))
             .collect();
-        let mut call = format!("install {snapshot} {}", versions.join(" "));
-        if !names.is_empty() {
-            call += &format!(" + {}", names.join(" "));
-        }
-        state.calls.push(call);
-        for spec in versions {
-            if let Some((name, version)) = spec.split_once('=') {
-                state.packages.insert(name.into(), version.into());
+        state
+            .calls
+            .push(format!("install {snapshot} + {}", names.join(" ")));
+        for name in &names {
+            let stem = name.strip_suffix(".deb").unwrap_or(name);
+            if let Some((package, version)) = stem.split_once('_') {
+                state.packages.insert(package.into(), version.into());
             }
         }
         Ok(())

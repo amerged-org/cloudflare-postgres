@@ -115,7 +115,7 @@ kill for as long as the node lives.
 | Sleep proof and its record | `proof.rs`, `sleep.rs`, `pg_control.rs`, `state.rs`                                                                                                    |
 | Roles                      | `roles.rs`, `scram.rs`: PostgreSQL holds exactly the roles of the page, with verifiers, never passwords                                                |
 | Backups                    | `archive/`: the archive socket, the barman-cloud jobs, restore and PITR recovery, the upload log                                                       |
-| Data events (1.6.0)        | `drain.rs`: the drain of one database (LISTEN, read, post, delete, pacing, backoff); `agent/drains.rs`: the hub, one drain per served database and the retries of its schema; `pgcf.rs` and `pgcf/schema.sql`: the platform schema `pgcf` the superuser installs, and the outbox's reads and deletes; `agent/build.rs` (`refresh_events`): the schema's record in `events.json` |
+| Data events (1.6.0)        | `drain.rs`: the drain of one database (LISTEN, read, post, delete, pacing, backoff); `agent/drains.rs`: the hub, one drain per served database and the retries of its schema; `pgcf.rs`, `pgcf/schema.sql` and `pgcf/baseline.sql`: the platform schema `pgcf` the superuser installs, the hardening baseline it applies with it (the large-object creators and the WAL message writers taken from `PUBLIC`), and the outbox's reads and deletes; `agent/build.rs` (`refresh_events`): the schema's record in `events.json` |
 | Fencing                    | `fence.rs`                                                                                                                                             |
 | Gateway channel            | `gateway.rs`: the writer table, the wakes, quiesce, close, status and activity                                                                         |
 | Metrics and diagnostics    | `usage.rs`, `sample.rs`, `events.rs`, `diagnostics/`                                                                                       |
@@ -205,7 +205,16 @@ which takes one order, from root. Every start takes one path: the admission perm
 3. **Order** (`exec`): sent only after all of that succeeded, because an idle slot's memory ceiling
    is below `shared_buffers`. A failure before the order stops the slot, and the database stays
    asleep with its proof: no PostgreSQL ran.
-4. **Ready**: an `inotify` watch on `postmaster.pid` and the slot's pidfd, never a poll.
+4. **Ready**: an `inotify` watch on `postmaster.pid` and the slot's pidfd, never a poll. The
+   database's user can replace `data` and `postmaster.pid`, so the agent reads it as root only as
+   a regular file of 4 KiB at most, after checking that `data` is no link (`units/ready.rs`,
+   `cache.rs`), and a pipe, a device or a link there is `postmaster_pid_unreadable`, never a wait.
+   The check is not a guarantee: a user who swaps `data` for a link between the check and the open
+   makes the agent read another path, which is harmless because the name is fixed, only a regular
+   file of at most 4 KiB is read, and the pid in it must be the unit's own main pid. A guarantee
+   would open the volume's directory once with `O_DIRECTORY | O_NOFOLLOW` (for `facts`,
+   `/proc/<pid>/root`) and resolve the rest with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
+   (Linux 5.6).
 
 The wake's phases are `slot` (take or build), `bind` (properties, mounts, order) and `start`
 (order to ready), and its detail says `slot_from` (`pool` or `demand`), `slot_wait_us`, `bind_us`
@@ -228,7 +237,10 @@ postmaster coming up without the lock).
 **The archive socket** knows a caller by the slot that holds it: the pool's table says which
 database a slot's uid belongs to, and only a process in that slot's cgroup and invocation (read from
 `/proc/<pid>/cgroup` and the `trusted.invocation_id` systemd keeps on the cgroup) is the holder's. A
-uid with no database now gets `peer_unknown`.
+uid with no database now gets `peer_unknown`. The socket holds 256 connections at once and 4 per
+uid (`MAX_CONNECTIONS`, `MAX_CONNECTIONS_PER_UID`): a connection beyond them is closed unread, so a
+flooding uid refuses only its own calls. A client that does not send its line within 2 s gets
+`bad_request`.
 
 **Adoption.** The table is never written to disk. When the agent starts it reads the units, each
 main process, `/proc/<pid>/exe`, its mount table and `/proc/locks` (`Pool::adopt`; the volume a
@@ -391,14 +403,15 @@ refill before the bind.
 | `/var/lib/pgcf/db/<id>`                        | The database's volume, mounted 0700 for `pgcf-<id>`; the data directory is `data`                                                                                                                           |
 | `/var/lib/pgcf/agent/databases/<id>`           | The database's state file (proven-sleep record, roles applied, newest base backup, whether the storage generation was built) and its upload log; not on the volume, which the database's user can rearrange |
 | `/var/lib/pgcf/agent/uids.json`, `fences.json` | The uid handed to each database, and the fence and superseded orders, fsynced before the agent acts on them                                                                                                 |
-| `/var/lib/pgcf/agent/usage.json`, `jobs/`      | The usage meter's place, and the barman jobs' environment files                                                                                                                                             |
+| `/var/lib/pgcf/agent/usage.json`               | The usage meter's place                                                                                                                                                                                     |
 | `/var/lib/pgcf/agent/boot-id`, `probes-done`   | The boot ID the agent last reported (a different kernel boot ID is a reboot, and the previous boot's journal goes to Cloudflare), and the diagnostic requests it has answered, so that a page that still lists one does not run it twice |
 | `/var/lib/pgcf/credentials/`                   | The node's Ed25519 key (`node-key.pk8`, readable by the agent only) and identity, the gateway's environment, the encrypted Tunnel token                                                                     |
 | `/var/lib/pgcf/enrollment/seed.json`           | The installer's seed, deleted after the enrollment                                                                                                                                                          |
 | `/var/lib/pgcf/bin/<release>/`, `bin/current`  | The binaries of each release and the link to the one that runs                                                                                                                                              |
-| `/run/pgcf/<id>`                               | The database's socket directory (`pgcf-<id>:pgcf-gateway`, 0750), made again for every database when the agent starts                                                                                       |
+| `/run/pgcf/<id>`                               | The database's socket directory (`pgcf-<id>:pgcf-gateway`, 0750), made again for every database when the agent starts, and emptied (the directory kept) at a bind and a stop while no slot or unit of its own holds the database                                                                                       |
 | `/run/pgcf/slot/<n>/control`                   | A slot's supervisor socket (`RuntimeDirectory=` of the unit, mode 0700 for the slot's user; only root is served)                                                                                              |
 | `/run/pgcf/agent/gateway.sock`, `archive.sock` | The gateway's channel (the gateway's user only) and the archive socket (the databases, known by the slot that holds them)                                                                                     |
+| `/run/pgcf/agent/jobs/`                        | The barman jobs' environment files (credentials): tmpfs, made private at each start, and what a crashed run left is removed then (so is the old `/var/lib/pgcf/agent/jobs`)                                                                            |
 
 `layout.rs` names the volumes, the agent's own directory, the databases' files, the jobs and the
 sockets, and tests give it another root. The rest are named where they are used: `credentials/`,
@@ -410,8 +423,10 @@ in `agent/mod.rs`, `bin/current` in `update.rs`, `main.rs` and `machine/node.rs`
 
 ## PostgreSQL configuration
 
-The agent writes `postgresql.conf`, `pg_hba.conf` and `pg_ident.conf` before every start and owns
-all three (`settings.rs`); a restored database's files are the source's and are replaced first.
+The agent writes `postgresql.conf`, `pg_hba.conf`, `pg_ident.conf` and `postgresql.auto.conf` before
+every start and owns all four (`settings.rs`); a restored database's files are the source's and are
+replaced first. `postgresql.auto.conf` is reset to its initdb header because PostgreSQL reads it
+after `postgresql.conf` and tenants cannot use `ALTER SYSTEM`.
 
 - **No network.** `listen_addresses` is empty and the socket directory is `/run/pgcf/<id>`.
 - **Memory** follows the database's memory size _m_ in MiB: `shared_buffers` _m_/8, `effective_cache_size`

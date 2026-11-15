@@ -36,7 +36,7 @@ use std::{
 };
 
 /// The files of a cluster's configuration: name and content.
-type Configuration = [(&'static str, String); 3];
+type Configuration = [(&'static str, String); 4];
 
 /// A build step that failed: the contract's error for the observation, and the step, by its place
 /// in this file, for the agent's log (a failure's own text can carry an address or a path).
@@ -276,6 +276,7 @@ impl<M: Machine> Core<M> {
             ("postgresql.conf", conf),
             ("pg_hba.conf", settings::PG_HBA.to_string()),
             ("pg_ident.conf", ident),
+            ("postgresql.auto.conf", settings::AUTO_CONF.to_string()),
         ];
         let mut hash = Sha256::new();
         for (name, content) in &files {
@@ -307,22 +308,15 @@ impl<M: Machine> Core<M> {
         Ok(hash)
     }
 
-    /// Writes the configuration again if the database's size or settings changed since the agent
-    /// wrote it: a resize applies at the next start. The unit must be stopped.
+    /// Writes the configuration at every start, whatever the stored hash says: a resize applies at
+    /// the next start, and the files on disk are re-asserted rather than trusted, so a change made
+    /// to them (in a base backup or from inside the sandbox) does not outlive a sleep. The unit must
+    /// be stopped.
     pub(crate) async fn refresh_configuration(&self, db: &Db, entry: &Entry) -> Result<(), Error> {
         let account = self
             .machine
             .account(&db.id)
             .ok_or("the database has no account")?;
-        let (_, hash) = self.configuration(entry, &account)?;
-        let held = db
-            .view()
-            .state
-            .as_ref()
-            .and_then(|state| state.config.clone());
-        if held.as_deref() == Some(hash.as_str()) {
-            return Ok(());
-        }
         let written = self.write_configuration(entry, &account)?;
         self.save_state(db, |state| state.config = Some(written))?;
         Ok(())
@@ -2050,7 +2044,6 @@ mod tests {
     async fn a_restores_configuration_is_persisted_before_its_first_cold_wake() {
         use crate::agent::power::{Slept, Why};
         use pgcf_native_protocol::wake::Outcome;
-        use std::os::unix::fs::MetadataExt;
 
         let Some(rig) = Rig::new("restore-config").await else {
             return;
@@ -2091,22 +2084,21 @@ mod tests {
             Some(&hash)
         );
         let data_path = rig.machine.layout().data(&entry.id);
-        let held: Vec<_> = configuration
-            .iter()
-            .map(|(name, content)| {
-                let path = data_path.join(name);
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), *content);
-                // Hold the old inode open so a needless unlink/rewrite cannot reuse it.
-                (path.clone(), std::fs::File::open(path).unwrap())
-            })
-            .collect();
+        for (name, content) in &configuration {
+            assert_eq!(
+                std::fs::read_to_string(data_path.join(name)).unwrap(),
+                *content
+            );
+        }
         assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
         let woke = rig.core.wake(&Rig::ticket(&entry)).await;
         assert_eq!(woke.outcome, Outcome::Started, "{woke:?}");
-        for (path, file) in held {
-            let before = file.metadata().unwrap();
-            let after = std::fs::metadata(path).unwrap();
-            assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        // Every start writes the files again, so they match the configuration after the wake too.
+        for (name, content) in &configuration {
+            assert_eq!(
+                std::fs::read_to_string(data_path.join(name)).unwrap(),
+                *content
+            );
         }
         let data = postgres::connect(
             &rig.machine.layout().socket_directory(&entry.id),
@@ -2121,6 +2113,79 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0].get::<_, i64>(0), 4000);
         assert_eq!(rows[0].get::<_, i64>(1), 8_002_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_configuration_write_clears_the_auto_conf_that_postgresql_reads_last() {
+        use crate::agent::power::{Slept, Why};
+        use pgcf_native_protocol::wake::Outcome;
+
+        let Some(rig) = Rig::new("auto-conf").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        let account = rig.machine.account(&entry.id).unwrap();
+        // What an archive's base backup could carry: settings that would redirect the recovery and
+        // the archive and move the access rules. PostgreSQL reads this file after postgresql.conf.
+        let auto = rig
+            .machine
+            .layout()
+            .data(&entry.id)
+            .join("postgresql.auto.conf");
+        std::fs::write(
+            &auto,
+            "restore_command = 'touch /tmp/pwned'\narchive_command = 'false'\nhba_file = '/x'\n",
+        )
+        .unwrap();
+        rig.core.write_configuration(&entry, &account).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&auto).unwrap(),
+            "# Do not edit this file manually!\n# It will be overwritten by the ALTER SYSTEM command.\n"
+        );
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, Outcome::Started, "{woke:?}");
+        let data = postgres::connect(
+            &rig.machine.layout().socket_directory(&entry.id),
+            "postgres",
+            &entry.id,
+        )
+        .await
+        .unwrap();
+        let rows = data
+            .query(
+                "SELECT count(*) FROM pg_settings WHERE name IN ('restore_command', 'archive_command', 'hba_file') AND sourcefile LIKE '%postgresql.auto.conf'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows[0].get::<_, i64>(0), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_start_writes_the_configuration_again_even_when_the_stored_hash_matches() {
+        use crate::agent::power::{Slept, Why};
+        use pgcf_native_protocol::wake::Outcome;
+
+        let Some(rig) = Rig::new("reassert-config").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        assert_eq!(rig.core.sleep(&db, Why::Idle).await, Slept::Proven);
+        // A change to the files on disk that the stored hash does not know about.
+        let data = rig.machine.layout().data(&entry.id);
+        let auto = data.join("postgresql.auto.conf");
+        std::fs::write(&auto, "archive_command = 'false'\n").unwrap();
+        let conf = data.join("postgresql.conf");
+        let before = std::fs::read_to_string(&conf).unwrap();
+        std::fs::write(&conf, format!("{before}log_min_messages = debug5\n")).unwrap();
+        let woke = rig.core.wake(&Rig::ticket(&entry)).await;
+        assert_eq!(woke.outcome, Outcome::Started, "{woke:?}");
+        assert_eq!(
+            std::fs::read_to_string(&auto).unwrap(),
+            "# Do not edit this file manually!\n# It will be overwritten by the ALTER SYSTEM command.\n"
+        );
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2371,6 +2436,126 @@ mod tests {
         );
         assert_eq!(
             rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Unchanged
+        );
+    }
+
+    /// Whether the role `reader`, which the superuser's session takes on, may call each of the
+    /// functions that PostgreSQL lets every role call and that write state or WAL without a table
+    /// privilege: the three that make a large object and the two forms of the WAL message.
+    async fn reader_writes_state(data: &postgres::Session) -> [bool; 5] {
+        let mut made = [false; 5];
+        data.batch("SET ROLE reader").await.unwrap();
+        for (index, sql) in [
+            "SELECT lo_create(0)",
+            "SELECT lo_creat(-1)",
+            "SELECT lo_from_bytea(0, '\\x00')",
+            "SELECT pg_logical_emit_message(true, 'p', 'x', true)",
+            "SELECT pg_logical_emit_message(true, 'p', '\\x00'::bytea, true)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            made[index] = match data.client.batch_execute(sql).await {
+                Ok(()) => true,
+                Err(error) => {
+                    assert_eq!(error.code().map(|code| code.code()), Some("42501"), "{sql}");
+                    false
+                }
+            };
+        }
+        data.batch("RESET ROLE").await.unwrap();
+        data.batch("SELECT lo_unlink(oid) FROM pg_largeobject_metadata")
+            .await
+            .unwrap();
+        made
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_database_is_hardened_at_creation_and_at_the_refresh_of_an_older_record_whoever_owns_pgcf()
+     {
+        let Some(rig) = Rig::new("events-baseline").await else {
+            return;
+        };
+        let (entry, db) = rig.create().await;
+        let data = in_database(&rig, &entry.id).await;
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+
+        // A database from before the baseline: PostgreSQL's defaults, and the earlier record.
+        let open = "GRANT EXECUTE ON FUNCTION pg_catalog.lo_create(oid), pg_catalog.lo_creat(integer), pg_catalog.lo_from_bytea(oid, bytea), pg_catalog.pg_logical_emit_message(boolean, text, text, boolean), pg_catalog.pg_logical_emit_message(boolean, text, bytea, boolean) TO PUBLIC";
+        data.batch(open).await.unwrap();
+        let settings = rig.core.event_settings(&entry);
+        let files = rig.core.files(&entry.id);
+        let mut earlier = pgcf::EventsRecord::of(&settings, false);
+        earlier.schema = pgcf::SCHEMA_REVISION - 1;
+        files.save_events(&earlier).unwrap();
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Installed
+        );
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+
+        // A tenant that took the name `pgcf` keeps the platform schema out, not the baseline.
+        data.batch("DROP SCHEMA pgcf CASCADE; CREATE SCHEMA pgcf AUTHORIZATION app")
+            .await
+            .unwrap();
+        data.batch(open).await.unwrap();
+        let mut earlier_conflict = pgcf::EventsRecord::of(&settings, true);
+        earlier_conflict.schema = pgcf::SCHEMA_REVISION - 1;
+        files.save_events(&earlier_conflict).unwrap();
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, false).await,
+            Refresh::Conflict
+        );
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, true))
+        );
+        data.batch("DROP SCHEMA pgcf CASCADE").await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+
+        // An error of the baseline ends the install: nothing is recorded, the refresh says it
+        // failed, and the next one finishes it. (The owner role has no name to grant to.)
+        std::fs::remove_file(files.directory().join("events.json")).unwrap();
+        data.batch("ALTER ROLE app RENAME TO app_renamed")
+            .await
+            .unwrap();
+        data.batch(open).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Failed
+        );
+        assert_eq!(files.load_events().unwrap(), None);
+        assert_eq!(reader_writes_state(&data).await, [true; 5]);
+        data.batch("ALTER ROLE app_renamed RENAME TO app")
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
+            Refresh::Installed
+        );
+        assert_eq!(reader_writes_state(&data).await, [false; 5]);
+
+        // The record is the current one and the database is hardened: a refresh opens no session.
+        // With the database stopped none can be opened, so the answer proves it.
+        assert_eq!(
+            files.load_events().unwrap(),
+            Some(pgcf::EventsRecord::of(&settings, false))
+        );
+        drop(data);
+        rig.machine.stop(&entry.id).await.unwrap();
+        assert_eq!(
+            rig.core.refresh_events(&db, &entry, true).await,
             Refresh::Unchanged
         );
     }

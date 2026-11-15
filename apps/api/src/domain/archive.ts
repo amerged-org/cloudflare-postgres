@@ -6,6 +6,7 @@ import { databaseForRequest } from "./rows.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { readRestoreCatalog } from "./restore-catalog.ts";
+import { digestMismatch, recordedDigests } from "./archive-digests.ts";
 import { retainedArchiveRestorable } from "./retained-archives.ts";
 
 export function validatedArchivePrefix(
@@ -117,7 +118,12 @@ export async function backupCatalog(
   const prefix = validatedArchivePrefix(row, selected.bucketName);
   let catalog;
   try {
-    catalog = await readRestoreCatalog(selected.bucket, prefix);
+    catalog = await readRestoreCatalog(
+      selected.bucket,
+      prefix,
+      undefined,
+      await recordedDigests(c.env.DB, row.archive_path),
+    );
   } catch (error) {
     if (
       error instanceof ApiError &&
@@ -126,6 +132,9 @@ export async function backupCatalog(
       return c.json(unknown);
     throw error;
   }
+  // Refused as changed only when no trusted backup is left to show.
+  if (catalog.backups.length === 0 && catalog.mismatched.length > 0)
+    throw digestMismatch();
   const oldest = catalog.backups.at(-1);
   if (oldest === undefined) return c.json(unknown);
   return c.json(

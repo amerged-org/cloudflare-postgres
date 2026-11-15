@@ -315,11 +315,11 @@ it("alarms a pool that placement has closed, by its data, its metadata or the lo
   const f = await fixture(0),
     hook = receiver(),
     now = Date.now();
-  // A pool of 100 GiB: closed from 80 GiB of data, 0.5 GiB of metadata, or 400 GiB sold.
+  // A pool of 100 GiB: closed from 80 GiB of data, 0.5 GiB of metadata, or 150 GiB sold.
   const closures: Partial<typeof OPEN_POOL>[] = [
     { dataUsed: 80 * GIB },
     { metadataUsed: GIB / 2 },
-    { nominal: 400 * GIB },
+    { nominal: 150 * GIB },
   ];
   let at = now;
   await seedSamples(f.node, [{ at, pool: pool({}) }]);
@@ -365,15 +365,15 @@ it("closes the pool for the smallest class on offer: 4 GiB below the logical cap
   const closed = () =>
     hook.events.filter((event) => event.kind === "regional_node_pool_closed");
   try {
-    // A pool of 100 GiB sells 400 GiB. The smallest class on offer is the fixture's 5 GiB: 395 GiB
-    // sold leave room for exactly one, 396 GiB do not, though the pool is below its cap.
+    // A pool of 100 GiB sells 150 GiB. The smallest class on offer is the fixture's 5 GiB: 145 GiB
+    // sold leave room for exactly one, 146 GiB do not, though the pool is below its cap.
     await seedSamples(f.node, [
-      { at: now, pool: pool({ nominal: 395 * GIB }) },
+      { at: now, pool: pool({ nominal: 145 * GIB }) },
     ]);
     await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
     expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
     await seedSamples(f.node, [
-      { at: now + 1000, pool: pool({ nominal: 396 * GIB }) },
+      { at: now + 1000, pool: pool({ nominal: 146 * GIB }) },
     ]);
     await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
     expect(closed()).toHaveLength(1);
@@ -413,13 +413,13 @@ it("closes the pool of a node that takes no new databases once the smallest clas
     .run();
   const closed = () =>
     hook.events.filter((event) => event.kind === "regional_node_pool_closed");
-  // 395 GiB of the 400 GiB sold: the 5 GiB class still fits.
-  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 395 * GIB }) }]);
+  // 145 GiB of the 150 GiB sold: the 5 GiB class still fits.
+  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 145 * GIB }) }]);
   await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
   expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
-  // 396 GiB: 4 GiB are left, the pool is below its cap and the smallest class does not fit.
+  // 146 GiB: 4 GiB are left, the pool is below its cap and the smallest class does not fit.
   await seedSamples(f.node, [
-    { at: now + 1000, pool: pool({ nominal: 396 * GIB }) },
+    { at: now + 1000, pool: pool({ nominal: 146 * GIB }) },
   ]);
   await runInfrastructureHealthAlerts(hook.env, now + 1000, hook.fetcher);
   expect(closed()).toHaveLength(1);
@@ -433,9 +433,9 @@ it("calls a region closed for the pool only when no node can take the smallest c
     at = Date.now();
   const closed = () =>
     hook.events.filter((event) => event.kind === "regional_node_pool_closed");
-  // The pools of 100 GiB sell 400 GiB. The first has 396 GiB sold: the 5 GiB class does not fit
+  // The pools of 100 GiB sell 150 GiB. The first has 146 GiB sold: the 5 GiB class does not fit
   // under its cap. The second is open, at 10 % RAM, and placement chooses it.
-  const sold = pool({ nominal: 396 * GIB });
+  const sold = pool({ nominal: 146 * GIB });
   await seedSamples(f.node, steady(at, 40, { ramPpm: 100_000, pool: sold }));
   await seedSamples(second, steady(at, 40, { ramPpm: 100_000 }));
   const nodes = await placementNodes(env.DB, f.region, at);
@@ -475,7 +475,7 @@ it("keeps the episode of a region whose open node is out of RAM while another is
   // The first node is at the cap; the second has a pool with room and 90 % RAM: nothing fits.
   await seedSamples(
     f.node,
-    steady(at, 40, { ramPpm: 100_000, pool: pool({ nominal: 396 * GIB }) }),
+    steady(at, 40, { ramPpm: 100_000, pool: pool({ nominal: 146 * GIB }) }),
   );
   await seedSamples(second, steady(at, 40, { ramPpm: 900_000 }));
   await runInfrastructureHealthAlerts(hook.env, at, hook.fetcher);
@@ -572,10 +572,10 @@ it("counts the storage a node has not finished against the logical cap of the al
   const f = await fixture(0),
     hook = receiver(),
     now = Date.now();
-  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 395 * GIB }) }]);
+  await seedSamples(f.node, [{ at: now, pool: pool({ nominal: 145 * GIB }) }]);
   await runInfrastructureHealthAlerts(hook.env, now, hook.fetcher);
   expect(await status(f, "regional_node_pool_closed")).toBeUndefined();
-  // A database of 5 GiB whose create the node has not finished: 400 GiB are sold, the cap.
+  // A database of 5 GiB whose create the node has not finished: 150 GiB are sold, the cap.
   const created = DatabaseWithOperation.parse(
     await (await f.create("unfinished")).json(),
   );

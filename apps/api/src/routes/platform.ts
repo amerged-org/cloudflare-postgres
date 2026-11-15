@@ -95,7 +95,7 @@ export function registerPlatform(app: ApiApp): void {
       security,
       tags: ["API keys"],
       description:
-        "Creates a key. The bootstrap token creates the first admin key exactly once. Credentials are returned once; successful idempotency replays return a safe conflict.",
+        "Creates a key. The bootstrap token creates the first admin key exactly once, and integrator keys for any existing project. An integrator key creates integrator keys for its own project. An administrator key creates administrator keys only. Credentials are returned once; successful idempotency replays return a safe conflict.",
       request: { headers, body: body(ApiKeyCreate) },
       responses: response(ApiKeyCreated, 201),
     },

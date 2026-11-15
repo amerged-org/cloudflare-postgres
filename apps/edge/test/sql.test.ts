@@ -101,6 +101,51 @@ async function post(
   return response;
 }
 
+/** A request body that counts how often it was read and whether it was cancelled. */
+function watched(next: () => Uint8Array | null) {
+  const state = { pulled: 0, cancelled: false };
+  const body = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        state.pulled++;
+        const chunk = next();
+        if (chunk === null) controller.close();
+        else controller.enqueue(chunk);
+      },
+      cancel() {
+        state.cancelled = true;
+      },
+    },
+    // No read ahead: only the handler's own read pulls.
+    { highWaterMark: 0 },
+  );
+  return { body, state };
+}
+
+async function postStream(
+  bindings: Env,
+  body: ReadableStream<Uint8Array>,
+  headers: Record<string, string> = {},
+): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(
+    new Request(`${origin}/sql`, {
+      method: "POST",
+      headers: {
+        "CF-Connecting-IP": [192, 0, 2, 1].join("."),
+        ...neonHeaders(),
+        ...headers,
+      },
+      body,
+      duplex: "half",
+    } as RequestInit),
+    bindings,
+    ctx,
+  );
+  await waitOnExecutionContext(ctx);
+  return response;
+}
+
 async function refusal(response: Response): Promise<string> {
   expect(response.status).toBe(400);
   const body = await response.json<{ code: string; message: string }>();
@@ -236,6 +281,30 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     });
   });
 
+  it("counts an admitted query once in the source limiter, and never a caller on a service binding", async () => {
+    const limit = vi.fn(async () => ({ success: true }));
+    const bindings = admitting(awake(), {
+      SOURCE_RATE_LIMITER: { limit } as unknown as RateLimit,
+    });
+    const admitted = await post(bindings, { query: "select 1", params: [] });
+    expect(admitted.status).toBe(200);
+    expect(limit).toHaveBeenCalledTimes(1);
+    limit.mockClear();
+    const ctx = createExecutionContext();
+    const viaBinding = await worker.fetch(
+      new Request(`${origin}/sql`, {
+        method: "POST",
+        headers: neonHeaders(),
+        body: JSON.stringify({ query: "select 1", params: [] }),
+      }),
+      bindings,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(viaBinding.status).toBe(200);
+    expect(limit).not.toHaveBeenCalled();
+  });
+
   it("logs the stages of a request: where it was admitted, its body, its statements and the Edge's share", async () => {
     const bindings = admitting(awake());
     const send = async (queries: unknown[]) => {
@@ -281,6 +350,7 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     const bindings = admitting(awake());
     const upload = async (chunks: string[]) => {
       const encoder = new TextEncoder();
+      let sent = 0;
       const ctx = createExecutionContext();
       const response = await worker.fetch(
         new Request(`${origin}/sql`, {
@@ -290,13 +360,12 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
             ...neonHeaders(),
           },
           body: new ReadableStream({
-            async start(controller) {
-              for (const [index, chunk] of chunks.entries()) {
-                if (index > 0)
-                  await new Promise((done) => setTimeout(done, 300));
-                controller.enqueue(encoder.encode(chunk));
-              }
-              controller.close();
+            // Each pause after the first chunk starts when the Edge has taken the chunk before
+            // it, so that the Edge's own work ahead of the read (its limiters) is not part of it.
+            async pull(controller) {
+              if (sent === chunks.length) return controller.close();
+              if (sent > 0) await new Promise((done) => setTimeout(done, 300));
+              controller.enqueue(encoder.encode(chunks[sent++]));
             },
           }),
           duplex: "half",
@@ -557,6 +626,89 @@ describe("HTTP SQL in the Neon serverless driver's wire format", () => {
     });
   });
 
+  it("refuses a limited client's body at the limiter, before anything reads, parses or validates it", async () => {
+    const limited = { limit: async () => ({ success: false }) } as RateLimit;
+    const admission = vi.fn(async () => awake());
+    const bindings = admitting(admission, { CONNECTION_RATE_LIMITER: limited });
+    const encoder = new TextEncoder();
+    const once =
+      (...chunks: Uint8Array[]) =>
+      () =>
+        chunks.shift() ?? null;
+    const uploads: [Uint8Array[], Record<string, string>][] = [
+      // Malformed JSON, invalid UTF-8, a body past the cap, and one that declares it.
+      [[encoder.encode('{"queries":'), encoder.encode("7}")], {}],
+      [[new Uint8Array([0xff, 0xfe])], {}],
+      [[new Uint8Array(MAX_SQL_REQUEST_BYTES + 1)], {}],
+      [
+        [new Uint8Array(1)],
+        { "Content-Length": String(MAX_SQL_REQUEST_BYTES + 1) },
+      ],
+    ];
+    for (const [chunks, headers] of uploads) {
+      const upload = watched(once(...chunks));
+      const response = await postStream(bindings, upload.body, headers);
+      // The limiter's answer, not the parser's (08P01) or the cap's (54000)...
+      expect(await refusal(response)).toBe("53300");
+      // ...and the Edge never took a byte of the body, nor reached the Actor or the gateway.
+      expect(upload.state.pulled).toBe(0);
+      const log = JSON.parse(logs.mock.calls.at(-1)![0] as string);
+      expect(log).toMatchObject({ event: "sql_admission", outcome: "53300" });
+      expect(log.body_ms).toBeUndefined();
+      expect(log.statements).toBeUndefined();
+    }
+    expect(admission).not.toHaveBeenCalled();
+    expect(await forwarded()).toHaveLength(0);
+  });
+
+  it("counts a body that is empty or turns out malformed against the limiters once, and never reaches the Actor", async () => {
+    // A transaction of no statements is answered at once; a malformed body is refused. Neither
+    // needs the Actor, and neither is free: each is one request of the client's budget.
+    for (const [body, code] of [
+      [{ query: 1 }, "08P01"],
+      [{ queries: [] }, null],
+    ] as const) {
+      const connection = vi.fn(async () => ({ success: true }));
+      const perDatabase = vi.fn(async () => ({ success: true }));
+      const admission = vi.fn(async () => awake());
+      const response = await post(
+        admitting(admission, {
+          CONNECTION_RATE_LIMITER: {
+            limit: connection,
+          } as unknown as RateLimit,
+          DATABASE_CONNECTION_RATE_LIMITER: {
+            limit: perDatabase,
+          } as unknown as RateLimit,
+        }),
+        body,
+      );
+      if (code === null) {
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ results: [] });
+      } else expect(await refusal(response)).toBe(code);
+      expect(connection).toHaveBeenCalledExactlyOnceWith({
+        key: JSON.stringify(["sql", database, "app", "ipv4:192.0.2.1"]),
+      });
+      expect(perDatabase).toHaveBeenCalledExactlyOnceWith({
+        key: JSON.stringify(["sql", database]),
+      });
+      expect(admission).not.toHaveBeenCalled();
+      expect(await forwarded()).toHaveLength(0);
+    }
+  });
+
+  it("aborts a chunked body at the size cap instead of buffering it", async () => {
+    const mebibyte = new Uint8Array(1024 * 1024);
+    // A stream that never ends: only the cap stops the read.
+    const upload = watched(() => mebibyte);
+    const response = await postStream(admitting(awake()), upload.body);
+    expect(await refusal(response)).toBe("54000");
+    expect(upload.state.cancelled).toBe(true);
+    expect(upload.state.pulled).toBe(
+      MAX_SQL_REQUEST_BYTES / mebibyte.length + 1,
+    );
+  });
+
   it("a caller without CF-Connecting-IP takes the binding limiter's own HTTP bucket, never a public one", async () => {
     const limiter = () =>
       ({
@@ -680,15 +832,33 @@ describe("HTTP SQL behind Cloudflare Access", () => {
     expect(text).not.toContain(accessSecret);
   });
 
-  it("presents nothing without the secrets, whatever the caller sends, and nothing over a service binding", async () => {
+  it("refuses a public gateway without the secrets before sending anything, whatever the caller sends", async () => {
     const caller = {
       ...neonHeaders(),
       "CF-Access-Client-Id": "caller-id",
       "CF-Access-Client-Secret": "caller-secret",
     };
-    expect(
-      (await post(admitting(open()), { query: "select 1" }, caller)).status,
-    ).toBe(200);
+    const response = await post(
+      admitting(open()),
+      { query: "select 1" },
+      caller,
+    );
+    expect(await refusal(response.clone())).toBe("08006");
+    expect(await forwarded()).toHaveLength(0);
+    expect(lastLog()).toMatchObject({
+      event: "sql_admission",
+      outcome: "08006",
+      config_error: "access_secrets_missing",
+    });
+    expect(lastLog().gateway_status).toBeUndefined();
+  });
+
+  it("presents nothing over a service binding, whatever the secrets", async () => {
+    const caller = {
+      ...neonHeaders(),
+      "CF-Access-Client-Id": "caller-id",
+      "CF-Access-Client-Secret": "caller-secret",
+    };
     expect(
       (await post(admitting(awake(), both), { query: "select 1" }, caller))
         .status,
@@ -704,7 +874,7 @@ describe("HTTP SQL behind Cloudflare Access", () => {
       ).status,
     ).toBe(200);
     const requests = await forwarded();
-    expect(requests).toHaveLength(3);
+    expect(requests).toHaveLength(2);
     for (const request of requests) expect(accessHeaders(request)).toEqual([]);
   });
 

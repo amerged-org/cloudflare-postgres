@@ -25,6 +25,7 @@ import {
   signedReleaseManifest,
 } from "@pgcf/contracts";
 import {
+  RELEASE_ENVIRONMENT,
   Refusal,
   githubKeys,
   verifyGithubToken,
@@ -128,6 +129,7 @@ function policyOf(env: Env, request: Request): Policy {
     repositoryOwnerId,
     ref,
     workflow,
+    environment: RELEASE_ENVIRONMENT,
     audience: new URL(request.url).origin,
   };
 }

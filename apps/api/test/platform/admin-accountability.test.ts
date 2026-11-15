@@ -155,6 +155,79 @@ describe("a read-only administrator key", () => {
   });
 });
 
+describe("who mints integrator keys", () => {
+  it("is the owner credential or an integrator key of the same project, never an administrator key", async () => {
+    const f = await fixture();
+    const refused = await request("/v1/api-keys", f.admin, "POST", {
+      name: "acct-key",
+      scope: "integrator",
+      project_id: f.project,
+    });
+    expect(refused.status).toBe(403);
+    expect(await code(refused)).toBe("forbidden");
+    const owner = await mint(env.BOOTSTRAP_TOKEN, {
+      scope: "integrator",
+      project_id: f.project,
+    });
+    expect(owner.api_key).toMatchObject({ scope: "integrator" });
+    // An integrator key mints for its own project only, and no administrator key at all.
+    const sibling = await request("/v1/api-keys", owner.key, "POST", {
+      name: "acct-sibling",
+      scope: "integrator",
+      project_id: f.project,
+    });
+    expect(sibling.status).toBe(201);
+    const elsewhere = await request("/v1/api-keys", owner.key, "POST", {
+      name: "acct-elsewhere",
+      scope: "integrator",
+      project_id: f.other,
+    });
+    expect(elsewhere.status).toBe(403);
+    const admin = await request("/v1/api-keys", owner.key, "POST", {
+      name: "acct-admin",
+      scope: "admin",
+    });
+    expect(admin.status).toBe(403);
+    expect(await code(admin)).toBe("forbidden");
+  });
+
+  it("refuses a read-only or an integrator key any administrator key, and keeps the table as it was", async () => {
+    const f = await fixture();
+    const reader = await mint(f.admin, { scope: "admin_read" });
+    const integrator = await mint(env.BOOTSTRAP_TOKEN, {
+      scope: "integrator",
+      project_id: f.project,
+    });
+    const before = await count("api_keys");
+    for (const key of [reader.key, integrator.key])
+      for (const scope of ["admin", "admin_read"] as const) {
+        const response = await request("/v1/api-keys", key, "POST", {
+          name: "acct-key",
+          scope,
+        });
+        expect(response.status, `${scope}`).toBe(403);
+        expect(await code(response)).toBe("forbidden");
+      }
+    expect(await count("api_keys")).toBe(before);
+  });
+
+  it("lets an administrator key make both administrator scopes, and the owner credential make integrator keys", async () => {
+    const f = await fixture();
+    for (const scope of ["admin", "admin_read"] as const)
+      expect((await mint(f.admin, { scope })).api_key).toMatchObject({
+        scope,
+      });
+    expect(
+      (
+        await mint(env.BOOTSTRAP_TOKEN, {
+          scope: "integrator",
+          project_id: f.project,
+        })
+      ).api_key,
+    ).toMatchObject({ scope: "integrator", project_id: f.project });
+  });
+});
+
 describe("key expiry", () => {
   it("gives an administrator key 90 days unless told otherwise and an integrator key none", async () => {
     const f = await fixture();
@@ -165,7 +238,7 @@ describe("key expiry", () => {
     expect(near(admin.api_key.expires_at, 90)).toBe(true);
     const reader = await mint(f.admin, { scope: "admin_read" });
     expect(near(reader.api_key.expires_at, 90)).toBe(true);
-    const integrator = await mint(f.admin, {
+    const integrator = await mint(env.BOOTSTRAP_TOKEN, {
       scope: "integrator",
       project_id: f.project,
     });
@@ -177,7 +250,7 @@ describe("key expiry", () => {
     const far = new Date(Date.now() + 1000 * DAY).toISOString();
     expect(
       (
-        await mint(f.admin, {
+        await mint(env.BOOTSTRAP_TOKEN, {
           scope: "integrator",
           project_id: f.project,
           expires_at: far,
@@ -201,12 +274,18 @@ describe("key expiry", () => {
       [new Date(Date.now() + 367 * DAY).toISOString(), "admin"],
       [new Date(Date.now() + 367 * DAY).toISOString(), "admin_read"],
     ] as const) {
-      const response = await request("/v1/api-keys", f.admin, "POST", {
-        name: "acct-key",
-        scope,
-        ...(scope === "integrator" ? { project_id: f.project } : {}),
-        expires_at,
-      });
+      // Only the owner credential makes an integrator key; an administrator key is refused for scope.
+      const response = await request(
+        "/v1/api-keys",
+        scope === "integrator" ? env.BOOTSTRAP_TOKEN : f.admin,
+        "POST",
+        {
+          name: "acct-key",
+          scope,
+          ...(scope === "integrator" ? { project_id: f.project } : {}),
+          expires_at,
+        },
+      );
       expect(response.status, `${scope} ${expires_at}`).toBe(400);
     }
     expect(await count("api_keys")).toBe(3);
@@ -225,7 +304,7 @@ describe("key expiry", () => {
     const refused = await request("/v1/nodes", soon.key);
     expect(refused.status).toBe(401);
     expect(await code(refused)).toBe("unauthorized");
-    const integrator = await mint(f.admin, {
+    const integrator = await mint(env.BOOTSTRAP_TOKEN, {
       scope: "integrator",
       project_id: f.project,
       expires_at: new Date(Date.now() + 3_600_000).toISOString(),
@@ -259,13 +338,13 @@ describe("the audit log", () => {
     );
     expect(revoked.status).toBe(204);
     expect((await request("/v1/nodes", f.admin)).status).toBe(200);
-    // Authenticated, then refused for the body: the outcome is the refusal, not 2xx.
+    // Authenticated, then refused for the scope it asks for: the outcome is the refusal, not 2xx.
     const missing = await request("/v1/api-keys", f.admin, "POST", {
       name: "acct-key",
       scope: "integrator",
       project_id: "prj_aaaaaaaaaaaaaaaaaaaa",
     });
-    expect(missing.status).toBe(404);
+    expect(missing.status).toBe(403);
 
     const rows = await rowsOf();
     expect(
@@ -274,7 +353,7 @@ describe("the audit log", () => {
       ["POST", "/v1/projects", 201, "admin"],
       ["POST", "/v1/api-keys", 201, "admin"],
       ["DELETE", "/v1/api-keys/{id}", 204, "admin"],
-      ["POST", "/v1/api-keys", 404, "admin"],
+      ["POST", "/v1/api-keys", 403, "admin"],
     ]);
     expect(rows[0]).toMatchObject({
       key_id: keyId,
@@ -332,7 +411,7 @@ describe("the audit log", () => {
     // The lookup identifier is in every key string and listed to every admin_read holder, so it is
     // not a secret: a request that only knows it must not be able to write a row.
     const wrongSecret = `${f.admin.slice(0, "pgcf_sk_".length + 12 + 1)}${newApiKey().key.slice(-43)}`;
-    const integrator = await mint(f.admin, {
+    const integrator = await mint(env.BOOTSTRAP_TOKEN, {
       scope: "integrator",
       project_id: f.project,
     });

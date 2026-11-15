@@ -59,8 +59,9 @@ function node(overrides: Partial<PlacementNode> = {}): PlacementNode {
     volumes_total: 0,
     ram_peak_ppm: 0,
     cpu_peak_ppm: 0,
-    ram_now_ppm: 0,
+    memory_available_bytes: NODE_BYTES,
     pending_memory_mib: 0,
+    placed_memory_mib: 0,
     pending_storage_mib: 0,
     ...overrides,
   };
@@ -72,9 +73,9 @@ const id = (letter: string) => `nod_${letter.repeat(20)}`;
 describe("which node takes a new database", () => {
   it("is the fullest node that stays under 80 % active RAM after the database", () => {
     const nodes = [
-      node({ id: id("a"), ram_peak_ppm: 500_000 }),
-      node({ id: id("b"), ram_peak_ppm: 300_000 }),
-      node({ id: id("c"), ram_peak_ppm: 700_000 }),
+      node({ id: id("a"), ram_peak_ppm: 500_000, placed_memory_mib: 512 }),
+      node({ id: id("b"), ram_peak_ppm: 300_000, placed_memory_mib: 256 }),
+      node({ id: id("c"), ram_peak_ppm: 700_000, placed_memory_mib: 2048 }),
     ];
     expect(pick(nodes)).toBe(id("c"));
     // Order of the list does not matter.
@@ -84,7 +85,8 @@ describe("which node takes a new database", () => {
   it("skips the fullest node when the database would take it to 80 % and goes on to the next", () => {
     const nodes = [
       node({ id: id("a"), ram_peak_ppm: 500_000 }),
-      node({ id: id("c"), ram_peak_ppm: 780_000 }),
+      // More memory placed on it, so only the 80 % veto keeps it from winning.
+      node({ id: id("c"), ram_peak_ppm: 780_000, placed_memory_mib: 1024 }),
     ];
     expect(pick(nodes)).toBe(id("a"));
   });
@@ -133,26 +135,56 @@ describe("which node takes a new database", () => {
 
   it("lets the newest sample stand in for an average that has not caught up with a burst of starts", () => {
     // The average is 10 %, the newest sample shows 75 % of the node in use: a 256 MiB database (2.5 %) reaches 77.5 %, 1,024 MiB (10 %) would not fit.
+    // 25 % of the 10 GiB node available: 75 % in use.
+    const quarterFree = NODE_BYTES * 0.25;
     expect(
-      pick([node({ ram_peak_ppm: 100_000, ram_now_ppm: 750_000 })]),
+      pick([
+        node({ ram_peak_ppm: 100_000, memory_available_bytes: quarterFree }),
+      ]),
     ).not.toBeNull();
     expect(
-      pick([node({ ram_peak_ppm: 100_000, ram_now_ppm: 750_000 })], {
-        ...SMALL,
-        memory_mib: 1024,
-      }),
+      pick(
+        [node({ ram_peak_ppm: 100_000, memory_available_bytes: quarterFree })],
+        { ...SMALL, memory_mib: 1024 },
+      ),
     ).toBeNull();
     // A sample below the average changes nothing.
     expect(
-      pick([node({ ram_peak_ppm: 790_000, ram_now_ppm: 100_000 })]),
+      pick([
+        node({
+          ram_peak_ppm: 790_000,
+          memory_available_bytes: NODE_BYTES * 0.9,
+        }),
+      ]),
     ).toBeNull();
   });
 
-  it("ranks by peak plus pending, so a node that just took several databases counts as fuller", () => {
+  it("ranks by the memory placed on each node, so a node that just took several databases counts as fuller", () => {
     expect(
       pick([
         node({ id: id("a"), ram_peak_ppm: 300_000 }),
-        node({ id: id("b"), ram_peak_ppm: 100_000, pending_memory_mib: 4096 }),
+        node({
+          id: id("b"),
+          ram_peak_ppm: 100_000,
+          pending_memory_mib: 4096,
+          placed_memory_mib: 4096,
+        }),
+      ]),
+    ).toBe(id("b"));
+  });
+
+  it("ranks by the memory placed on each node, so a node's own report cannot make it the fullest", () => {
+    // The forged node reports 79.9 % in use of a 1 TiB total and holds no database.
+    expect(
+      pick([
+        node({
+          id: id("a"),
+          memory_total_bytes: 2 ** 40,
+          memory_available_bytes: 2 ** 40,
+          ram_peak_ppm: 799_000,
+          placed_memory_mib: 0,
+        }),
+        node({ id: id("b"), ram_peak_ppm: 300_000, placed_memory_mib: 2048 }),
       ]),
     ).toBe(id("b"));
   });
@@ -226,23 +258,23 @@ describe("which node takes a new database", () => {
     ).toBeNull();
   });
 
-  it("keeps the sold storage within four times the pool's data", () => {
+  it("keeps the sold storage within 150 % of the pool's data", () => {
     const pool = (nominal: number) =>
       node({ pool_data_total_bytes: 100 * GIB, pool_nominal_bytes: nominal });
-    // 400 GiB is the logical cap; the database brings 5 GiB.
-    expect(pick([pool(395 * GIB)])).not.toBeNull();
-    expect(pick([pool(395 * GIB + 1)])).toBeNull();
-    expect(pick([pool(400 * GIB)])).toBeNull();
+    // 150 GiB is the logical cap; the database brings 5 GiB.
+    expect(pick([pool(145 * GIB)])).not.toBeNull();
+    expect(pick([pool(145 * GIB + 1)])).toBeNull();
+    expect(pick([pool(150 * GIB)])).toBeNull();
   });
 
   it("counts the storage of databases the node has not finished against the same cap", () => {
     const pool = (pending: number) =>
       node({
         pool_data_total_bytes: 100 * GIB,
-        pool_nominal_bytes: 390 * GIB,
+        pool_nominal_bytes: 140 * GIB,
         pending_storage_mib: pending * 1024,
       });
-    // The cap is 400 GiB; 390 GiB are reported, the database brings 5 GiB.
+    // The cap is 150 GiB; 140 GiB are reported, the database brings 5 GiB.
     expect(pick([pool(5)])).not.toBeNull();
     expect(pick([pool(6)])).toBeNull();
     expect(pick([pool(10)])).toBeNull();
@@ -252,13 +284,13 @@ describe("which node takes a new database", () => {
     const mib = 1024 ** 2;
     const pool = node({
       pool_data_total_bytes: 100 * GIB,
-      pool_nominal_bytes: 398 * GIB,
+      pool_nominal_bytes: 148 * GIB,
       pending_storage_mib: 1024 + 500,
     });
     expect(pick([pool], { ...SMALL, storage_mib: 524 })).not.toBeNull();
     expect(pick([pool], { ...SMALL, storage_mib: 528 })).toBeNull();
     expect(
-      pick([{ ...pool, pool_nominal_bytes: 398 * GIB + mib }], {
+      pick([{ ...pool, pool_nominal_bytes: 148 * GIB + mib }], {
         ...SMALL,
         storage_mib: 524,
       }),
@@ -278,7 +310,7 @@ describe("which node takes a new database", () => {
 
 /**
  * What closes a node's pool for new databases (plan 4.3, 4.8): 80 % of its data, 50 % of its
- * metadata, the sold storage at four times its data (the cap) and 1,000 volumes. While the pool
+ * metadata, the sold storage at 150 % of its data (the cap) and 1,000 volumes. While the pool
  * has room, only the cap stops a resize that grows storage, whatever else has closed the node: a
  * resize creates no volume and takes no real space (handover 2.5). A pool with no room (the agent
  * reports `room: false` below the free-data reserve or at 75 % of the metadata) stops it too.
@@ -365,11 +397,11 @@ describe("which node takes the storage growth of a database it holds (plan 3.5)"
         pool_data_used_bytes: 80 * GIB,
         pool_nominal_bytes: nominal * GIB,
       });
-    expect(growthFits(full(399), GROW, NOW)).toBe(true);
-    expect(growthFits(full(399), { ...GROW, storage_mib: 2048 }, NOW)).toBe(
+    expect(growthFits(full(149), GROW, NOW)).toBe(true);
+    expect(growthFits(full(149), { ...GROW, storage_mib: 2048 }, NOW)).toBe(
       false,
     );
-    expect(growthFits(full(400), GROW, NOW)).toBe(false);
+    expect(growthFits(full(150), GROW, NOW)).toBe(false);
   });
 });
 
@@ -553,12 +585,19 @@ describe("the load of a node, read from its samples", () => {
     expect((await load(f.region, a)).pending_memory_mib).toBe(512 + 1024);
   });
 
-  it("reads the active RAM of the newest sample", async () => {
+  it("reads the available memory of the newest sample", async () => {
     const { f, a } = await regionWith();
     await seedSamples(a, steady(NOW, 5, { ramPpm: 250_000 }));
     const got = await load(f.region, a);
-    expect(got.ram_now_ppm).toBeGreaterThan(240_000);
-    expect(got.ram_now_ppm).toBeLessThan(260_000);
+    expect(got.memory_available_bytes).toBe(NODE_BYTES * 0.75);
+  });
+
+  it("does not throw on a forged memory total, and the node that reports it is not chosen", async () => {
+    const { f, a } = await regionWith();
+    await seedSamples(a, steady(NOW, 5, { totalBytes: 9e15, usedBytes: 8e15 }));
+    const nodes = await placementNodes(env.DB, f.region, NOW);
+    expect(() => choosePlacement(nodes, SMALL, NOW)).not.toThrow();
+    expect(choosePlacement(nodes, SMALL, NOW)).toBeNull();
   });
 
   it("does not count a database that is deleted", async () => {
@@ -722,7 +761,7 @@ describe("placement over real samples", () => {
 
   it("stops a burst of creates at the logical cap before the node has reported any of them", async () => {
     const f = await fixture(0);
-    // 30 GiB of pool data give a cap of 120 GiB; 115 GiB are sold when the node last reported.
+    // 30 GiB of pool data give a cap of 45 GiB; 40 GiB are sold when the node last reported.
     await seedSamples(
       f.node,
       steady(Date.now(), 40, {
@@ -730,7 +769,7 @@ describe("placement over real samples", () => {
           ...OPEN_POOL,
           dataTotal: 30 * GIB,
           dataUsed: 0,
-          nominal: 115 * GIB,
+          nominal: 40 * GIB,
         },
       }),
     );
@@ -752,7 +791,25 @@ describe("placement over real samples", () => {
     await seedSamples(quiet, recent({ ramPpm: 100_000 }));
     await seedSamples(busy, recent({ ramPpm: 600_000 }));
     await seedSamples(full, recent({ ramPpm: 790_000 }));
+    // The API placed a 2 GiB database on the busy node: the placed memory ranks the nodes.
+    await env.DB.prepare(
+      `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib)
+      VALUES(?,?,?,?,'placed',?,'running','ready',1,'s3://b/x',?,?,?,2048)`,
+    )
+      .bind(
+        "d" + crypto.randomUUID().replaceAll("-", "").slice(0, 19),
+        f.project,
+        f.region,
+        busy,
+        f.size,
+        new Date().toISOString(),
+        new Date().toISOString(),
+        // Before the newest sample, so the sample already includes it.
+        new Date(Date.now() - 3_600_000).toISOString(),
+      )
+      .run();
     const nodes = await placementNodes(env.DB, f.region);
+    expect(nodes.find((n) => n.id === busy)?.placed_memory_mib).toBe(2048);
     // 512 MiB are 5 % of the node: 79 % + 5 % crosses 80 %, 60 % + 5 % does not.
     expect(
       choosePlacement(nodes, {

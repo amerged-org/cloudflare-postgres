@@ -1677,9 +1677,13 @@ export type NodeObservationAnswer = z.infer<typeof NodeObservationAnswer>;
 export const NodeSample = z
   .strictObject({
     observed_at: Timestamp,
-    /** MemTotal and MemAvailable. */
+    /**
+     * MemTotal and MemAvailable. A node is far below 1 TiB; the bound keeps the arithmetic of one
+     * sample inside SQLite's 64-bit integers. Placement ranks on the memory placed, not on these
+     * readings, so a node that reports odd totals cannot buy placement with them.
+     */
     memory: z.strictObject({
-      total_bytes: Positive,
+      total_bytes: Positive.max(2 ** 40),
       available_bytes: Bytes,
     }),
     /** Busy CPU averaged over the interval since the previous sample. */

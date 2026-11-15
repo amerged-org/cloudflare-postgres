@@ -11,7 +11,7 @@ import {
 import { ApiError } from "../api-error.ts";
 import { requireExtendedNative } from "./native-capabilities.ts";
 import { keyring } from "../crypto/keyring.ts";
-import type { ApiContext } from "../env.ts";
+import type { ApiContext, AuthPrincipal } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
@@ -466,6 +466,26 @@ export async function deleteRole(
     },
   });
 }
+/**
+ * The stored password of a role for an API caller, or null. Only an integrator key reads it: the
+ * one accessor the API decrypts a role's password through, so that an administrator key of either
+ * scope never sees one.
+ */
+export async function passwordForCaller(
+  env: Pick<ApiContext["env"], "CREDENTIAL_KEYS">,
+  auth: AuthPrincipal,
+  id: string,
+  name: string,
+  role: Pick<RoleRow, "password_ciphertext" | "password_iv" | "password_kid">,
+): Promise<string | null> {
+  if (auth.scope !== "integrator") return null;
+  return keyring(env.CREDENTIAL_KEYS).decrypt(id, name, {
+    ciphertext: role.password_ciphertext,
+    iv: role.password_iv,
+    kid: role.password_kid,
+  });
+}
+
 export async function connectionUri(
   c: ApiContext,
   id: string,
@@ -480,14 +500,7 @@ export async function connectionUri(
     host.includes("..")
   )
     throw new ApiError("internal", "Database endpoint is not configured");
-  const includesPassword = auth.scope === "integrator";
-  const password = includesPassword
-    ? await keyring(c.env.CREDENTIAL_KEYS).decrypt(id, name, {
-        ciphertext: role.password_ciphertext,
-        iv: role.password_iv,
-        kid: role.password_kid,
-      })
-    : null;
+  const password = await passwordForCaller(c.env, auth, id, name, role);
   const uri = `postgres://${encodeURIComponent(name)}${password === null ? "" : `:${encodeURIComponent(password)}`}@${host}/${id}`;
   return c.json(
     ConnectionUri.parse({
@@ -496,7 +509,7 @@ export async function connectionUri(
       host,
       database: id,
       uri,
-      includes_password: includesPassword,
+      includes_password: password !== null,
     }),
   );
 }

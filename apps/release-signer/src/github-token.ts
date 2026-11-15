@@ -35,6 +35,13 @@ export class Refusal extends Error {
   }
 }
 
+/**
+ * The GitHub environment the signing job runs in. Its protection rules (a required reviewer who
+ * did not push, a branch rule) are repository settings the owner keeps; the signer checks only that
+ * the run came through the environment, so a job that skips it is refused.
+ */
+export const RELEASE_ENVIRONMENT = "release";
+
 /** The workflow that may ask: the variables of the Worker. */
 export interface Policy {
   repository: string;
@@ -43,6 +50,8 @@ export interface Policy {
   repositoryOwnerId: string;
   ref: string;
   workflow: string;
+  /** The environment the run must name, `RELEASE_ENVIRONMENT`. */
+  environment: string;
   /** The signer's own address, which the run asked GitHub to put in the token. */
   audience: string;
 }
@@ -184,6 +193,7 @@ export async function verifyGithubToken(
       `${policy.repository}/${policy.workflow}@${policy.ref}`,
     ],
     ["runner_environment", "github-hosted"],
+    ["environment", policy.environment],
   ];
   for (const [name, value] of expected)
     if (payload[name] !== value) throw new Refusal(403, `claim_${name}`);

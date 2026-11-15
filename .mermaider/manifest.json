@@ -17,15 +17,15 @@
     },
     {
       "path": "docs/architecture/mermaider/api-resources.md",
-      "sha256": "5bc10cc30e1297424a20e31398a71f6399c5c804384bed1551eb01bbda685edb"
+      "sha256": "f088d5975131c4b1a52244c4037571d5806fa50928a4eeaf7d20ba499ca6c40b"
     },
     {
       "path": "docs/architecture/mermaider/api-resources.mmd",
-      "sha256": "6fbfe29467723a88ddf7b88b68c7dbf2a8715bc62f372275cbbc8d037503e7fc"
+      "sha256": "f9c87f5e816f0eb03f8019606b6dcc00db01c800358ba1e12b2044441d15960d"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
-      "sha256": "dd18dd12db8dee678739acd875537e609e77ba9f0c2a280c34016d71c5ff5dd2"
+      "sha256": "c4c8f19f074a4a2bf4b24ffca8c786e427862e7dfdfb8c338c486574a02a6ebc"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.mmd",
@@ -33,7 +33,7 @@
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
-      "sha256": "7068af32d1df63b7aa24a217aecb828c157cf70bd8fdd4e97d9a721569dca2a3"
+      "sha256": "2df7e4f53e106366de7f1fd2e2ca59ac8b3fdf429dc8d4efd85ba1cc4269e53b"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.mmd",
@@ -41,18 +41,18 @@
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.md",
-      "sha256": "dddafc45d79e753e28308eacae7fc512fda679a65a05da740258daf4615ec617"
+      "sha256": "9b6fe8658797ee505939a9becaabf1c81542a88fea5526a73b16a699b4ac5512"
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.mmd",
-      "sha256": "372f60b005fd98532a7705e40bb4718dd717755e43530f01d6ee7529e751beab"
+      "sha256": "961eaeb14af6783a7aabbdbf19384b33e972a12039ce0ce13cff510c50925658"
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "bad9d9fd072bf003e3ae64935302d64856eb43836b4601927560da650c5244aa"
+      "sha256": "ebac9a458ad69b8a3b833380017400f9df6f7f85027186326f5009fed2b751ff"
     }
   ],
-  "fingerprint": "2be0bd1a5695ab93d3afc633b5f12fe58eb4fdba300a0949edb26bc1a1086f02",
+  "fingerprint": "8d639c90315bf2a7f987ef468bccfc0cac9cfdd328fde7fd92cf7e922fb5e337",
   "toolVersion": "0.1.1",
   "version": 1
 }

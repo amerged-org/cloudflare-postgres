@@ -357,6 +357,10 @@ impl<M: Machine> Service<M> {
         let table = Arc::new(Table::default());
         let credentials = Arc::new(Credentials::default());
         crate::link::file::create_private_directory(&layout.jobs())?;
+        crate::archive::job::remove_leftovers(&layout.jobs())?;
+        // An earlier agent left a crashed run's environment file on the root disk; it goes now,
+        // and a failure to remove it must not keep the agent from starting.
+        let _ = std::fs::remove_dir_all(layout.legacy_jobs());
         let jobs = Arc::new(Jobs::new(
             Runner::new(&layout.systemd_run, &layout.barman_bin, layout.jobs()),
             policy.backup.clone(),
@@ -1579,10 +1583,12 @@ impl<M: Machine> Service<M> {
             .await
             .map_err(|_| "packages_not_read")?;
         let plan = update::plan(&lock, &installed);
-        if !(plan.versions.is_empty() && plan.files.is_empty()) {
+        if !plan.files.is_empty() {
+            // Every package comes from its lock's file, checked against the lock's digest and size
+            // by the link before apt sees it.
             let mut files = Vec::new();
             for package in &plan.files {
-                let path = work.join(format!("{}.deb", package.name));
+                let path = work.join(format!("{}_{}.deb", package.name, package.version));
                 self.link
                     .fetch(
                         &package.pinned.url,
@@ -1595,7 +1601,7 @@ impl<M: Machine> Service<M> {
                 files.push(path);
             }
             self.machine
-                .install_packages(&release.debian_snapshot, &plan.versions, &files)
+                .install_packages(&release.debian_snapshot, &files)
                 .await
                 .map_err(|_| "packages_not_installed")?;
             // Nothing that can fail comes between the install of a kernel and its boot: the order
@@ -3419,6 +3425,13 @@ mod tests {
         use sha2::{Digest, Sha256};
         crate::update::hex(&Sha256::digest(bytes))
     }
+    /// A lock entry of a package the cloud serves as a file: the node downloads it and checks it
+    /// against the entry's digest and size, so a maintenance test needs the bytes behind it.
+    fn served(cloud: &Cloud, name: &str, version: &str) -> serde_json::Value {
+        let bytes = format!("{name} {version}").into_bytes();
+        let url = cloud.serve_file(&format!("/files/{name}_{version}.deb"), bytes.clone());
+        json!({"name": name, "version": version, "architecture": "amd64", "url": url, "size": bytes.len(), "sha256": digest(&bytes)})
+    }
     /// The files the node runs, in `bin/<id>/`, and the `current` link to them.
     fn runs(machine: &crate::machine::local::Local, id: &str, files: &[(&str, &[u8])]) {
         let bin = machine.layout().state.join("bin");
@@ -5022,10 +5035,12 @@ mod tests {
         let cloud = Cloud::start().await;
         let deb = b"cloudflared 2026.10.1".to_vec();
         let url = cloud.serve_file("/files/cloudflared.deb", deb.clone());
+        let pg = b"postgresql 18.7".to_vec();
+        let pg_url = cloud.serve_file("/files/postgresql-18.deb", pg.clone());
         let lock = json!({
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": "https://snapshot.example/pg.deb", "size": 10, "sha256": "b".repeat(64)},
+                {"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": pg_url, "size": pg.len(), "sha256": digest(&pg)},
                 {"name": "cloudflared", "version": "2026.10.1", "architecture": "amd64", "url": url, "size": deb.len(), "sha256": digest(&deb)},
             ],
             "extra": [
@@ -5050,14 +5065,13 @@ mod tests {
                 .any(|order| order["operation"] == operation && order["status"] == "done")
         })
         .await;
-        // The pinned versions are installed from the release's snapshot, the extra package as the
-        // file it downloaded (a real lock lists it among its packages too), and the node is checked
-        // afterwards. No reboot: no kernel changed.
+        // Each package that differs is installed from the file its lock pinned, checked against the
+        // lock's digest, and the node is checked afterwards. No reboot: no kernel changed.
         let calls = machine.calls();
         let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
         assert!(
             calls.contains(
-                &"install 20261016T000000Z postgresql-18=18.7-1 cloudflared=2026.10.1 + cloudflared.deb"
+                &"install 20261016T000000Z + postgresql-18_18.7-1.deb cloudflared_2026.10.1.deb"
                     .to_string()
             ),
             "{calls:?}"
@@ -5155,7 +5169,7 @@ mod tests {
         let lock = json!({
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "linux-image-6.12.99-amd64", "version": "6.12.99-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+                served(&cloud, "linux-image-6.12.99-amd64", "6.12.99-1"),
             ],
             "extra": [],
         })
@@ -5237,10 +5251,12 @@ mod tests {
         ]);
         let cloud = Cloud::start().await;
         let package = |name: &str, version: &str| json!({"name": name, "version": version, "architecture": "amd64", "url": format!("https://snapshot.example/{name}.deb"), "size": 10, "sha256": "a".repeat(64)});
+        let pg = b"postgresql 18.7".to_vec();
+        let pg_url = cloud.serve_file("/files/postgresql-18.deb", pg.clone());
         let lock = json!({
             "packages": [
                 package("bash", "5.2"),
-                package("postgresql-18", "18.7-1"),
+                json!({"name": "postgresql-18", "version": "18.7-1", "architecture": "amd64", "url": pg_url, "size": pg.len(), "sha256": digest(&pg)}),
                 package("linux-image-6.12.111+deb13-amd64", "6.12.111-1"),
             ],
             "extra": [],
@@ -5322,7 +5338,7 @@ mod tests {
         let lock = json!({
             "packages": [
                 {"name": "bash", "version": "5.2", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+                served(&cloud, "linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
             ],
             "extra": [],
         })
@@ -5420,8 +5436,8 @@ mod tests {
         let cloud = Cloud::start().await;
         let lock = json!({
             "packages": [
-                {"name": "bash", "version": "5.3", "architecture": "amd64", "url": "https://snapshot.example/bash.deb", "size": 10, "sha256": "a".repeat(64)},
-                {"name": "linux-image-6.12.113+deb13-amd64", "version": "6.12.113-1", "architecture": "amd64", "url": "https://snapshot.example/k.deb", "size": 10, "sha256": "c".repeat(64)},
+                served(&cloud, "bash", "5.3"),
+                served(&cloud, "linux-image-6.12.113+deb13-amd64", "6.12.113-1"),
             ],
             "extra": [],
         })

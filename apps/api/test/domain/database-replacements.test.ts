@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { openLink, nextMessage, heldLink } from "./node-fixtures.ts";
 import { afterEach, expect, it } from "vitest";
@@ -207,6 +208,7 @@ async function capable() {
     keys.push(key);
     await env.ARCHIVE.put(key, value!);
   }
+  await reportedBackup(row.archive_path, BACKUP.backup_id);
   return f;
 }
 async function start(
@@ -812,6 +814,7 @@ it("pins rollback to the newest backup in the quiesced proof rather than the old
     keys.push(key);
     await env.ARCHIVE.put(key, value!);
   }
+  await reportedBackup(row.archive_path, latest.backup_id);
   await applyLifecycleObservations(
     env,
     f.node,
@@ -1137,6 +1140,7 @@ it("retains the newer prior-state promise when an earlier successful replacement
     keys.push(key);
     await env.ARCHIVE.put(key, value);
   }
+  await reportedBackup(firstEntry.archive.path, BACKUP.backup_id);
   const second = await start(f),
     row = await f.row();
   const proof = {

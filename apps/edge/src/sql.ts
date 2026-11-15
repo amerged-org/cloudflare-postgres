@@ -4,8 +4,11 @@
  * (`neon()`, `transaction()`). Each request is admitted as a WebSocket connection is admitted (the
  * same limiters, in buckets of their own, and the DatabaseActor's admission), signed a route and
  * forwarded once to the region's gateway, which runs it on a pooled PostgreSQL session
- * (`apps/native-gateway/src/sql.rs`). The Edge never retries a forwarded request: an answer that
- * does not come from the gateway is reported as an unknown outcome (08007).
+ * (`apps/native-gateway/src/sql.rs`). The limiters come first, from the headers alone, so that
+ * a client over its budget costs no body read, no parsing and no validation; the Actor's admission
+ * and the route follow the understood body (a route token lives 30 s, a slow upload must not
+ * outlive it). The Edge never retries a forwarded request: an answer that does not come from the
+ * gateway is reported as an unknown outcome (08007).
  *
  * The password of the connection string goes to the gateway in the request body only; it is
  * never logged, and neither are statements or parameters.
@@ -31,6 +34,7 @@ import {
   admitRoute,
   bounded,
   edgeShare,
+  limitRoute,
   nextIsolateRequest,
   type AdmissionTimings,
 } from "./admission.ts";
@@ -55,6 +59,17 @@ interface Timings extends AdmissionTimings {
   gateway_error?: string;
   /** A configuration that kept the Edge from reaching the gateway: its name, never a value. */
   config_error?: string;
+}
+
+/** HTTP requests count in buckets of their own, so queries never take WebSocket handshakes. */
+const SCOPE = ["sql"] as const;
+
+/** An admission's refusal as the HTTP answer: a decoy is a refused password. */
+function refusedAs(error: unknown): never {
+  if (!(error instanceof AdmissionFailure)) throw error;
+  throw error.decoy
+    ? authenticationFailed()
+    : new SqlFailure(error.sqlstate, error.message);
 }
 
 function json(body: unknown, status: number): Response {
@@ -208,6 +223,8 @@ export async function serveSql(
       throw new SqlFailure("08P01", "HTTP SQL requires POST");
     const routed = (target = connection(request.headers));
     const characteristics = transaction(request.headers);
+    // Before the body is read, parsed or validated: a limited client is refused as it arrives.
+    await limitRoute(request, env, routed, timings, SCOPE).catch(refusedAs);
     const bodyStarted = Date.now();
     let understood: ReturnType<typeof statements>;
     try {
@@ -219,17 +236,21 @@ export async function serveSql(
     timings.statements = queries.length;
     if (batch && queries.length === 0) return json({ results: [] }, 200);
     const body = forwardBody(routed.password, understood, characteristics);
-    // HTTP requests count in buckets of their own, so queries never take WebSocket handshakes.
+    // The limiters have counted the request; the Actor's admission and the route are left.
     const admitted = await bounded(request, ctx, (signal, deadline) =>
-      admitRoute(request, env, routed, cid, signal, deadline, ctx, timings, [
-        "sql",
-      ]),
-    ).catch((error: unknown) => {
-      if (!(error instanceof AdmissionFailure)) throw error;
-      throw error.decoy
-        ? authenticationFailed()
-        : new SqlFailure(error.sqlstate, error.message);
-    });
+      admitRoute(
+        request,
+        env,
+        routed,
+        cid,
+        signal,
+        deadline,
+        ctx,
+        timings,
+        SCOPE,
+        true,
+      ),
+    ).catch(refusedAs);
     region = admitted.region.id;
     return await forward(
       admitted.region,

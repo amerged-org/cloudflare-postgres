@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 /**
  * The admission every database request takes, a WebSocket connection (`index.ts`) and an HTTP
- * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission run together, and
- * an admitted request is signed its route to the node's gateway.
+ * query (`sql.ts`) alike: the Edge limiters and the DatabaseActor's admission, and an admitted
+ * request is signed its route to the node's gateway. Both count the source network first
+ * (`limitSource`), before any Actor is got. Then the limiters count the request (`limitRoute`) and
+ * only an admitted request reaches the Actor's admission, which may wake the database: a WebSocket
+ * upgrade counts there before its admission, an HTTP query counts before its body is read and takes
+ * the Actor's admission after the body is understood.
  */
 import {
   parseRouteKeyring,
@@ -20,7 +24,11 @@ export interface Hints {
 
 /** Milliseconds of each admission stage that ran, logged with the admission. */
 export interface AdmissionTimings {
-  /** The limiters, which run in parallel with the Actor's admission. */
+  /**
+   * The limiters: the source limiter first and alone, then the others in parallel with each other,
+   * for both kinds of request, before the Actor's admission begins (and, for an HTTP query, ahead
+   * of the body). The stage is the longest of its limiters' waits, not their sum.
+   */
   limiters_ms?: number;
   admit_ms?: number;
   /** A thrown RPC and an Actor's generic failure are distinct; never log exception text. */
@@ -75,9 +83,129 @@ export function databaseActor(env: Env, database: string) {
   );
 }
 
+type Limit = readonly [limiter: RateLimit, key: string, refusal: string];
+
 /**
- * Admits `hints` and signs its route. `scope` prefixes the limiter keys, so that a kind of
- * request (HTTP queries: `["sql"]`) counts in buckets of its own of the same limiters.
+ * The limiters a request counts in, keyed by what is known before any body: the database and role
+ * of the hints and the caller's network. `scope` prefixes the keys, so that a kind of request
+ * (HTTP queries: `["sql"]`) counts in buckets of its own of the same limiters.
+ */
+function routeLimits(
+  request: Request,
+  env: Env,
+  hints: Hints,
+  scope: readonly string[],
+): Limit[] {
+  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
+  if (network === null)
+    throw new AdmissionFailure("53300", "connection rate limit exceeded");
+  // Shared proxy networks must not couple unrelated database/role routes.
+  // These untrusted hints scope admission; PostgreSQL authenticates the user.
+  const key = JSON.stringify([...scope, hints.database, hints.user, network]);
+  // A same-account Worker on a service binding has a budget of its own per database and role; it
+  // never drains, or is drained by, the public buckets.
+  return network === "binding"
+    ? [
+        [
+          env.BINDING_CONNECTION_RATE_LIMITER,
+          key,
+          "connection rate limit exceeded",
+        ],
+      ]
+    : [
+        [env.CONNECTION_RATE_LIMITER, key, "connection rate limit exceeded"],
+        [
+          env.DATABASE_CONNECTION_RATE_LIMITER,
+          scope.length === 0
+            ? hints.database
+            : JSON.stringify([...scope, hints.database]),
+          "database connection rate limit exceeded",
+        ],
+      ];
+}
+
+/** Counts the request in every limiter at once; `limiters_ms` is the slowest one's wait. */
+function countLimits(
+  limits: readonly Limit[],
+  timings: AdmissionTimings,
+  started: number,
+): Promise<RateLimitOutcome>[] {
+  return limits.map(async ([limiter, key]) =>
+    limiter.limit({ key }).finally(() => {
+      timings.limiters_ms = Math.max(
+        timings.limiters_ms ?? 0,
+        Date.now() - started,
+      );
+    }),
+  );
+}
+
+/**
+ * The source limiter: one coarse bucket per source network across every database and route, so
+ * that fresh database identities cannot escape the limits below. A caller on a service binding (no
+ * `CF-Connecting-IP`) keeps its own budget and never counts here; a malformed address is refused by
+ * the connection limiters that `routeLimits` checks.
+ */
+async function limitSource(
+  request: Request,
+  env: Env,
+  timings: AdmissionTimings,
+): Promise<void> {
+  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
+  if (network === null || network === "binding") return;
+  const limits: Limit[] = [
+    [env.SOURCE_RATE_LIMITER, network, "connection rate limit exceeded"],
+  ];
+  const outcomes = await Promise.allSettled(
+    countLimits(limits, timings, Date.now()),
+  );
+  refuseLimited(limits, outcomes);
+}
+
+/** Refuses with 53300 when a limiter failed or said no. */
+function refuseLimited(
+  limits: readonly Limit[],
+  outcomes: PromiseSettledResult<RateLimitOutcome>[],
+): void {
+  if (outcomes.some((outcome) => outcome.status === "rejected"))
+    throw new AdmissionFailure("53300", "connection admission unavailable");
+  for (const [index, [, , message]] of limits.entries())
+    if (
+      !(outcomes[index] as PromiseFulfilledResult<RateLimitOutcome>).value
+        .success
+    )
+      throw new AdmissionFailure("53300", message);
+}
+
+/**
+ * The limiters alone: for a request whose body is read after, so that a client over its budget is
+ * refused before the Edge takes a byte of the body, and a body that is never understood still
+ * counts. `admitRoute` then takes `counted` and does not count the request again.
+ */
+export async function limitRoute(
+  request: Request,
+  env: Env,
+  hints: Hints,
+  timings: AdmissionTimings,
+  scope: readonly string[],
+): Promise<void> {
+  const check = () => {
+    if (request.signal.aborted)
+      throw new AdmissionFailure("08006", "connection admission interrupted");
+  };
+  check();
+  await limitSource(request, env, timings);
+  const limits = routeLimits(request, env, hints, scope);
+  const outcomes = await Promise.allSettled(
+    countLimits(limits, timings, Date.now()),
+  );
+  check();
+  refuseLimited(limits, outcomes);
+}
+
+/**
+ * Admits `hints` and signs its route. `scope` prefixes the limiter keys (see `routeLimits`);
+ * `counted` says that `limitRoute` has counted the request already.
  */
 export async function admitRoute(
   request: Request,
@@ -89,39 +217,18 @@ export async function admitRoute(
   ctx: ExecutionContext,
   timings: AdmissionTimings,
   scope: readonly string[] = [],
+  counted = false,
 ): Promise<{ region: GatewayRegion; token: string }> {
   const check = () => {
     if (signal.aborted)
       throw new AdmissionFailure("08006", "connection admission interrupted");
   };
   check();
-  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
-  if (network === null)
-    throw new AdmissionFailure("53300", "connection rate limit exceeded");
-  // Shared proxy networks must not couple unrelated database/role routes.
-  // These untrusted hints scope admission; PostgreSQL authenticates the user.
-  const key = JSON.stringify([...scope, hints.database, hints.user, network]);
-  // A same-account Worker on a service binding has a budget of its own per database and role; it
-  // never drains, or is drained by, the public buckets.
-  const limits: [RateLimit, string, string][] =
-    network === "binding"
-      ? [
-          [
-            env.BINDING_CONNECTION_RATE_LIMITER,
-            key,
-            "connection rate limit exceeded",
-          ],
-        ]
-      : [
-          [env.CONNECTION_RATE_LIMITER, key, "connection rate limit exceeded"],
-          [
-            env.DATABASE_CONNECTION_RATE_LIMITER,
-            scope.length === 0
-              ? hints.database
-              : JSON.stringify([...scope, hints.database]),
-            "database connection rate limit exceeded",
-          ],
-        ];
+  // A request that `limitRoute` counted has passed the limiters already; any other request is
+  // counted here, and only once the limiters admit it does the Actor run, so a refused connect
+  // never wakes a database.
+  if (!counted) await limitRoute(request, env, hints, timings, scope);
+  check();
   const actor = databaseActor(env, hints.database);
   const cancel = () =>
     ctx.waitUntil(
@@ -130,56 +237,31 @@ export async function admitRoute(
         .catch(() => false),
     );
   signal.addEventListener("abort", cancel, { once: true });
-  // The limiters and the Actor's admission run together: none of them waits for another. The
-  // per-database bucket therefore also counts connects that admission refuses.
   const started = Date.now();
-  const limited = async (limiter: RateLimit, limitKey: string) =>
-    limiter.limit({ key: limitKey }).finally(() => {
-      timings.limiters_ms = Math.max(
-        timings.limiters_ms ?? 0,
-        Date.now() - started,
-      );
-    });
-  let admission: PromiseSettledResult<DatabaseWakeAdmission>;
-  let outcomes: PromiseSettledResult<RateLimitOutcome>[];
+  let admitted: DatabaseWakeAdmission;
   try {
     check();
-    [admission, ...outcomes] = await Promise.allSettled([
-      actor
-        .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
-        .catch((reason: unknown) => {
-          // A 12 s live stall returned 08006 without a matching Actor log. Keep the RPC's
-          // diagnostic flags, not its message/name/cause/stack, so the next probe can distinguish
-          // that failure from an Actor that ran and returned a refusal.
-          const flags =
-            typeof reason === "object" && reason !== null
-              ? (reason as Record<string, unknown>)
-              : {};
-          timings.admit_error = "rpc_exception";
-          timings.admit_retryable = flags.retryable === true;
-          timings.admit_overloaded = flags.overloaded === true;
-          timings.admit_remote = flags.remote === true;
-          throw reason;
-        })
-        .finally(() => {
-          timings.admit_ms = Date.now() - started;
-        }),
-      ...limits.map(([limiter, limitKey]) => limited(limiter, limitKey)),
-    ]);
+    admitted = await actor
+      .admitWake(hints.database, hints.user, { deadline, waiterId: cid })
+      .catch((reason: unknown) => {
+        // A 12 s live stall returned 08006 without a matching Actor log. Keep the RPC's
+        // diagnostic flags, not its message/name/cause/stack, so the next probe can distinguish
+        // that failure from an Actor that ran and returned a refusal.
+        const flags =
+          typeof reason === "object" && reason !== null
+            ? (reason as Record<string, unknown>)
+            : {};
+        timings.admit_error = "rpc_exception";
+        timings.admit_retryable = flags.retryable === true;
+        timings.admit_overloaded = flags.overloaded === true;
+        timings.admit_remote = flags.remote === true;
+        throw reason;
+      });
   } finally {
+    timings.admit_ms = Date.now() - started;
     signal.removeEventListener("abort", cancel);
   }
   check();
-  if (outcomes.some((outcome) => outcome.status === "rejected"))
-    throw new AdmissionFailure("53300", "connection admission unavailable");
-  for (const [index, [, , message]] of limits.entries())
-    if (
-      !(outcomes[index] as PromiseFulfilledResult<RateLimitOutcome>).value
-        .success
-    )
-      throw new AdmissionFailure("53300", message);
-  if (admission.status === "rejected") throw admission.reason;
-  const admitted = admission.value;
   if (!admitted.ok) {
     switch (admitted.sqlstate) {
       case "3D000":

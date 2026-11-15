@@ -26,7 +26,8 @@ import {
 } from "./rows.ts";
 import { archiveBucket } from "./archive-bucket.ts";
 import { validatedArchivePrefix } from "./archive.ts";
-import { restoreBackup } from "./restore-catalog.ts";
+import { archiveCutoff, restoreBackup } from "./restore-catalog.ts";
+import { recordedDigests } from "./archive-digests.ts";
 import { ensureArchiveCredential } from "./archive-credentials.ts";
 import {
   publishForAnswer,
@@ -196,10 +197,13 @@ export async function startDatabaseReplacement(
         now,
       });
       const selected = archiveBucket(c.env),
+        fencedAt = await archiveCutoff(c.env.DB, source.node_id),
         backup = await restoreBackup(
           selected.bucket,
           validatedArchivePrefix(source, selected.bucketName),
           body.target_time,
+          fencedAt,
+          await recordedDigests(c.env.DB, source.archive_path),
         );
       const op = newOperationId();
       const result = await withAdmissionMutation(

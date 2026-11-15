@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import { afterEach, expect, it } from "vitest";
 import {
   assignRelease,
@@ -72,6 +73,7 @@ async function archived(
     keys.push(key!);
     await env.ARCHIVE.put(key!, value!);
   }
+  await reportedBackup(row!.archive_path, backupId);
   return {
     ...f,
     id: database.id,

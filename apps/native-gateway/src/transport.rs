@@ -28,7 +28,7 @@ use tokio::{
     net::{TcpListener, TcpStream, UnixStream},
     sync::{Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch},
     task::JoinSet,
-    time::timeout,
+    time::{timeout, timeout_at},
 };
 use tokio_tungstenite::{
     WebSocketStream, accept_async_with_config,
@@ -43,6 +43,10 @@ type WebSocket = WebSocketStream<BudgetedStream>;
 pub const SESSION_MEMORY_BYTES: usize = 2 * MAX_FRAME_BYTES + 16 * 1024;
 /// The time a connection has to send its StartupMessage and have its writer dialled.
 pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
+/// The time a connection may stay unauthenticated after its first write to PostgreSQL. PostgreSQL
+/// holds a backend slot while it waits for the login; a slow honest client needs two SCRAM round
+/// trips well inside this bound.
+pub const AUTHENTICATION_BOUND: Duration = Duration::from_secs(10);
 /// How long a held wake connection waits for its release, counted from its upgrade.
 pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
 /// The time one write of frontend bytes to PostgreSQL may take.
@@ -52,13 +56,23 @@ pub struct Config {
     /// The node this gateway serves; its keyring verifies only the routes made for it.
     pub node: String,
     pub keyring: Keyring,
+    /// The accounted buffer memory of the whole gateway, the reserve included.
     pub maximum_memory: usize,
+    /// The most one database may hold.
     pub database_memory: usize,
+    /// The part of `maximum_memory` only databases under `guaranteed_memory` can draw on.
+    pub reserve_memory: usize,
+    /// What every database may hold before it competes for the shared part.
+    pub guaranteed_memory: usize,
+    /// How long one HTTP SQL request's statements may run before the gateway cancels them.
+    pub statement_bound: Duration,
 }
 pub(crate) struct Admission {
     pub(crate) replay: ReplayCache,
     counts: HashMap<String, usize>,
     total: usize,
+    /// The sessions of each database that have not authenticated yet.
+    unauthenticated: HashMap<String, usize>,
 }
 impl Default for Admission {
     fn default() -> Self {
@@ -66,6 +80,29 @@ impl Default for Admission {
             replay: ReplayCache::new(50_000),
             counts: HashMap::new(),
             total: 0,
+            unauthenticated: HashMap::new(),
+        }
+    }
+}
+/// The most sessions of one database that may be connected and not yet authenticated. Each one
+/// holds one of PostgreSQL's connection slots before it proves a password, so the bound keeps
+/// connections that never log in from taking every slot of the database.
+pub(crate) const UNAUTHENTICATED_LIMIT: usize = 8;
+/// One session of a database that has not authenticated yet, counted until it is dropped.
+pub(crate) struct Unauthenticated {
+    gateway: Arc<Gateway>,
+    database: String,
+}
+impl Drop for Unauthenticated {
+    fn drop(&mut self) {
+        let mut admission = self.gateway.admission.lock().unwrap();
+        let count = admission
+            .unauthenticated
+            .get_mut(&self.database)
+            .expect("an unauthenticated session is counted");
+        *count -= 1;
+        if *count == 0 {
+            admission.unauthenticated.remove(&self.database);
         }
     }
 }
@@ -100,7 +137,12 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(config: Arc<Config>) -> Arc<Self> {
         Arc::new(Self {
-            memory: MemoryBudget::new(config.maximum_memory, config.database_memory),
+            memory: MemoryBudget::new(
+                config.maximum_memory,
+                config.database_memory,
+                config.reserve_memory,
+                config.guaranteed_memory,
+            ),
             config,
             table: Arc::default(),
             sessions: Arc::new(Mutex::new(Sessions::default())),
@@ -110,6 +152,26 @@ impl Gateway {
             stage_marks: local::StageQueue::default(),
             sql: crate::sql::Pool::default(),
             admission: Mutex::new(Admission::default()),
+        })
+    }
+    /// Counts one more session of `database` that has not authenticated, or refuses it when the
+    /// database has [`UNAUTHENTICATED_LIMIT`] of them.
+    pub(crate) fn begin_authentication(
+        self: &Arc<Self>,
+        database: &str,
+    ) -> Result<Unauthenticated, &'static str> {
+        let mut admission = self.admission.lock().unwrap();
+        let count = admission
+            .unauthenticated
+            .entry(database.to_owned())
+            .or_default();
+        if *count >= UNAUTHENTICATED_LIMIT {
+            return Err("too many unauthenticated sessions");
+        }
+        *count += 1;
+        Ok(Unauthenticated {
+            gateway: self.clone(),
+            database: database.to_owned(),
         })
     }
     /// Reserves the session of an admitted route. `replay` is false only for a held wake
@@ -157,6 +219,7 @@ impl Gateway {
                 id,
                 target: target.clone(),
                 wire,
+                unauthenticated: Mutex::new(None),
             },
             actions,
         ))
@@ -253,45 +316,108 @@ impl Gateway {
         self.table.read().await.permits(database, writer)
     }
     /// Writes `bytes` to a session's writer while the database admits new work and `writer` is its
-    /// writer, holding the table for the bounded write: a change that would stop the write waits
-    /// for it. Any other change of the database's entry, such as a later route revision, leaves
-    /// the session's admission as it was.
+    /// writer. Any other change of the database's entry, such as a later route revision, leaves
+    /// the session's admission as it was. See [`Gateway::write_fenced`] for how the table is held.
+    ///
+    /// Precondition, kept by each caller and not by the types: the session `id` is marked busy
+    /// before the call (`Sessions::update`), because the table is not held while the bytes wait
+    /// for room in PostgreSQL's socket, and a message whose first bytes crossed is finished after
+    /// a published change: the busy session is what the agent's quiesce waits for. Call sites:
+    /// the first write of `run_session`, and `sql::write_guarded` (the StartupMessage, the
+    /// pipeline and the cleanup of a session).
     pub(crate) async fn write_admitted(
         &self,
+        id: &str,
         database: &str,
         writer: &Writer,
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<(), Blocked> {
-        let table = self.table.read().await;
-        if !table.admits(database) {
-            return Err(Blocked::Fenced);
-        }
-        if !table.permits(database, writer) {
-            return Err(Blocked::TargetChanged);
-        }
-        bounded_write(postgres, bytes).await
+        self.write_fenced(id, postgres, bytes, |table| {
+            if !table.admits(database) {
+                return Err(Blocked::Fenced);
+            }
+            if !table.permits(database, writer) {
+                return Err(Blocked::TargetChanged);
+            }
+            Ok(true)
+        })
+        .await
+        .map(|_| ())
     }
     /// Writes `bytes` of a running session while its database runs on `writer`; false, with
-    /// nothing written, while the database is quiescing or retired. The table is held through
-    /// the bounded write, so new bytes never cross a published change. Without the channel the
+    /// nothing written, while the database is quiescing or retired. Without the channel the
     /// last table stands: only the agent stops a database, and it does so over the channel or by
-    /// stopping the unit, which ends the session.
+    /// stopping the unit, which ends the session. See [`Gateway::write_fenced`] for how the table
+    /// is held.
+    ///
+    /// Precondition, kept by each caller and not by the types: the session `id` is marked busy
+    /// before the call, as for [`Gateway::write_admitted`]. Call site: `forward_if_running`, for
+    /// the relay's client messages and the bytes it held.
     pub(crate) async fn write_running(
         &self,
+        id: &str,
         database: &str,
         writer: &Writer,
         postgres: &mut UnixStream,
         bytes: &[u8],
     ) -> Result<bool, Blocked> {
-        let table = self.table.read().await;
-        if !table.permits(database, writer) {
-            return Err(Blocked::TargetChanged);
+        self.write_fenced(id, postgres, bytes, |table| {
+            if !table.permits(database, writer) {
+                return Err(Blocked::TargetChanged);
+            }
+            Ok(table.mode(database) == Some(Mode::Running))
+        })
+        .await
+    }
+    /// Writes `bytes` to PostgreSQL while `fence`, asked of the table, lets them through: `Ok(true)`
+    /// writes, `Ok(false)` holds them (nothing written, and the answer is false), an error refuses
+    /// them.
+    ///
+    /// The table is node-global, and a PostgreSQL that stops reading its socket is the tenant's to
+    /// make, so the table is never held while waiting for room in the socket: the fence is asked
+    /// under the table's read guard and the guard is dropped again around one non-blocking write.
+    /// A write that finds no room waits for it outside the table and asks the fence again, so
+    /// bytes never begin to cross a change the table has published. Once the first of the bytes is
+    /// in the socket the rest follow outside the table, so a message is never split: its session
+    /// is busy for as long (the caller marks it busy before it writes), which is what the agent's
+    /// quiescence waits for. All of it is bounded by one [`WRITE_BOUND`]; a write that is not done
+    /// by then is [`Blocked::Lost`].
+    async fn write_fenced(
+        &self,
+        id: &str,
+        postgres: &mut UnixStream,
+        bytes: &[u8],
+        fence: impl Fn(&LocalTable) -> Result<bool, Blocked>,
+    ) -> Result<bool, Blocked> {
+        debug_assert!(
+            self.sessions.lock().unwrap().marked_busy(id),
+            "session {id} writes to PostgreSQL without being marked busy"
+        );
+        let deadline = tokio::time::Instant::now() + WRITE_BOUND;
+        loop {
+            let written = {
+                let table = self.table.read().await;
+                if !fence(&table)? {
+                    return Ok(false);
+                }
+                postgres.try_write(bytes)
+            };
+            match written {
+                Ok(written) => {
+                    return match timeout_at(deadline, postgres.write_all(&bytes[written..])).await {
+                        Ok(Ok(())) => Ok(true),
+                        _ => Err(Blocked::Lost),
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if !matches!(timeout_at(deadline, postgres.writable()).await, Ok(Ok(()))) {
+                        return Err(Blocked::Lost);
+                    }
+                }
+                Err(_) => return Err(Blocked::Lost),
+            }
         }
-        if table.mode(database) != Some(Mode::Running) {
-            return Ok(false);
-        }
-        bounded_write(postgres, bytes).await.map(|()| true)
     }
     /// What a session of the database does now, given what it was last asked: run, hold its
     /// bytes while the database quiesces, or close.
@@ -332,18 +458,25 @@ impl Gateway {
         Ok(())
     }
 }
-async fn bounded_write(postgres: &mut UnixStream, bytes: &[u8]) -> Result<(), Blocked> {
-    match timeout(WRITE_BOUND, postgres.write_all(bytes)).await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(Blocked::Lost),
-    }
-}
 pub(crate) struct SessionLease {
     gateway: Arc<Gateway>,
     database: String,
     pub(crate) id: String,
     pub(crate) target: Writer,
     wire: WireBudget,
+    /// Counted while the session has not authenticated; released by `authenticated`.
+    unauthenticated: Mutex<Option<Unauthenticated>>,
+}
+impl SessionLease {
+    /// Holds the count of an unauthenticated session until it authenticates.
+    pub(crate) fn hold_unauthenticated(&self, counted: Unauthenticated) {
+        *self.unauthenticated.lock().unwrap() = Some(counted);
+    }
+    /// Releases the count: the session has authenticated, or it was dropped.
+    pub(crate) fn authenticated(&self) {
+        let released = self.unauthenticated.lock().unwrap().take();
+        drop(released);
+    }
 }
 impl Drop for SessionLease {
     fn drop(&mut self) {
@@ -662,6 +795,18 @@ pub async fn serve_socket(
         return memory_refused(&mut socket, &gateway, &claims.db).await;
     };
     let wire = WireBudget::new(gateway.memory.lease(&claims.db));
+    let unauthenticated = match gateway.begin_authentication(&claims.db) {
+        Ok(counted) => counted,
+        Err(_) => {
+            stages.outcome = "admission_denied";
+            return http::reply(
+                &mut socket,
+                429,
+                serde_json::json!({"error":"admission_denied"}),
+            )
+            .await;
+        }
+    };
     let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, true) {
         Ok(value) => value,
         Err(status) => {
@@ -674,6 +819,7 @@ pub async fn serve_socket(
             .await;
         }
     };
+    session.hold_unauthenticated(unauthenticated);
     // The route names the database, the user and the unit, so nothing the StartupMessage says
     // changes where PostgreSQL is dialled: the dial overlaps the client's own round trips to it
     // (the upgrade, the answer to SSLRequest, the StartupMessage). Not a byte is sent before the
@@ -1044,6 +1190,14 @@ async fn serve_held(
             return Ok(());
         }
     };
+    let unauthenticated = match gateway.begin_authentication(&claims.db) {
+        Ok(counted) => counted,
+        Err(_) => {
+            stages.outcome = "admission_denied";
+            let _ = send_error(&mut websocket, "53300", "too many connections").await;
+            return Ok(());
+        }
+    };
     let (session, mut actions) = match gateway.reserve(&claims, wire.clone(), &target, false) {
         Ok(value) => value,
         Err(_) => {
@@ -1052,6 +1206,7 @@ async fn serve_held(
             return Ok(());
         }
     };
+    session.hold_unauthenticated(unauthenticated);
     {
         // The session is measured from its reservation; what the client sent while held is its.
         let mut metrics = gateway.measurements.lock().unwrap();
@@ -1136,7 +1291,7 @@ async fn run_session(
         }
         update(gateway, id, &activity, true, false);
         match gateway
-            .write_admitted(&claims.db, target, &mut postgres, &initial)
+            .write_admitted(id, &claims.db, target, &mut postgres, &initial)
             .await
         {
             Ok(()) => {}
@@ -1157,7 +1312,7 @@ async fn run_session(
         let mut held = None;
         if let Some(password) = password {
             let login = tokio::select! {
-                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&password,None))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
+                login=timeout(STARTUP_BOUND,auth::login(&mut postgres,&claims.db,&password,None))=>login.map_err(|_|"startup_timeout").and_then(|login|login.map_err(|_|"postgres_error")),
                 _=stop.changed()=>Err("gateway_draining"),
                 _=interrupted(actions)=>Err("fenced"),
             };
@@ -1188,6 +1343,9 @@ async fn run_session(
                     metrics.authenticate(id);
                 }
                 metrics.egress(id, answer.len());
+            }
+            if activity.authenticated() {
+                session.authenticated();
             }
             update(gateway, id, &activity, true, false);
             send_client(websocket, Message::Binary(answer.into()), stages).await?;
@@ -1636,6 +1794,10 @@ async fn relay(
     heartbeat.tick().await;
     let mut physical_timer = tokio::time::interval(Duration::from_millis(100));
     let database = id.split_once('/').expect("bound session identity").0;
+    // The relay is entered after the first upstream write, which the session's stages record.
+    let authentication = tokio::time::Instant::from_std(
+        stages.written.unwrap_or_else(Instant::now) + AUTHENTICATION_BOUND,
+    );
     update(gateway, id, activity, false, false);
     loop {
         if !gateway.permits(database, target).await {
@@ -1649,7 +1811,7 @@ async fn relay(
             && let Some((bytes, lease)) = held.take()
         {
             update(gateway, id, activity, true, false);
-            if forward_if_running(gateway, database, target, postgres, &bytes, stages).await? {
+            if forward_if_running(gateway, id, database, target, postgres, &bytes, stages).await? {
                 drop(lease);
             } else {
                 held = Some((bytes, lease));
@@ -1695,6 +1857,11 @@ async fn relay(
                 close(websocket,CloseCode::Restart,"gateway restarting").await;
                 break;
             },
+            _=tokio::time::sleep_until(authentication),if !activity.authenticated()=>{
+                stages.outcome="authentication_timeout";
+                let _=send_error(websocket,"08006","database connection failed").await;
+                break;
+            },
             _=actions.changed()=>{},
             _=physical_timer.tick()=>{},
             _=heartbeat.tick(),if mode==Action::Running=>{if !alive{stages.outcome="heartbeat_timeout";break;}alive=false;send_client(websocket,Message::Ping(Vec::new().into()),stages).await?;},
@@ -1704,7 +1871,7 @@ async fn relay(
                         let lease=wire.take_message().inspect_err(|_|stages.outcome="websocket_error")?;{let mut metrics=gateway.measurements.lock().unwrap();metrics.ingress(id,bytes.len());if !bytes.is_empty(){metrics.client_activity(id);}}
                         activity.observe_frontend(&bytes);update(gateway,id,activity,true,false);
                         if held.is_some(){stages.outcome="database_retired";close(websocket,CloseCode::Restart,"database retired").await;break;}
-                        if forward_if_running(gateway,database,target,postgres,&bytes,stages).await?{drop(lease);}
+                        if forward_if_running(gateway,id,database,target,postgres,&bytes,stages).await?{drop(lease);}
                         else{held=Some((bytes.to_vec(),vec![lease]));}
                     },
                     Some(Ok(Message::Pong(_)))=>alive=true,
@@ -1718,6 +1885,7 @@ async fn relay(
             result=postgres.read(&mut read)=>{
                 let length=result.inspect_err(|_|stages.outcome="postgres_error")?;if length==0{stages.outcome="postgres_closed";break;}activity.observe_backend(&read[..length]);
                 {let mut metrics=gateway.measurements.lock().unwrap();if activity.authenticated(){metrics.authenticate(id);}metrics.egress(id,length);}
+                if activity.authenticated(){session.authenticated();}
                 update(gateway,id,activity,true,false);send_client(websocket,Message::Binary(read[..length].to_vec().into()),stages).await?;
                 stages.first_backend.get_or_insert_with(Instant::now);
             }
@@ -1730,16 +1898,18 @@ async fn relay(
 /// Forwards client bytes while the database runs on the session's writer; false while they wait.
 async fn forward_if_running(
     gateway: &Gateway,
+    id: &str,
     database: &str,
     target: &Writer,
     postgres: &mut UnixStream,
     bytes: &[u8],
     stages: &mut Stages,
 ) -> Result<bool, Failure> {
-    // The bounded enqueue and the table's changes share this read/write boundary.
-    // Bytes already being written stay busy; new bytes cannot cross a published change.
+    // The fence is asked of the table before bytes begin to cross, never while they wait for room
+    // in PostgreSQL's socket. Bytes already being written stay busy; new bytes cannot begin to
+    // cross a published change.
     match gateway
-        .write_running(database, target, postgres, bytes)
+        .write_running(id, database, target, postgres, bytes)
         .await
     {
         Ok(written) => Ok(written),
@@ -1775,6 +1945,9 @@ mod tests {
             },
             maximum_memory: 192 << 20,
             database_memory: 96 << 20,
+            reserve_memory: 96 << 20,
+            guaranteed_memory: 3 << 20,
+            statement_bound: crate::sql::STATEMENT_BOUND,
         }))
     }
     fn route(route_revision: u64) -> Route {
@@ -1787,6 +1960,21 @@ mod tests {
             route_revision,
             instance: INSTANCE.into(),
         }
+    }
+
+    #[test]
+    fn a_database_holds_eight_unauthenticated_sessions_and_releases_one_per_guard() {
+        let gateway = gateway();
+        let mut held: Vec<Unauthenticated> = (0..UNAUTHENTICATED_LIMIT)
+            .map(|_| gateway.begin_authentication(DATABASE).unwrap())
+            .collect();
+        assert!(gateway.begin_authentication(DATABASE).is_err());
+        // Another database's sessions are counted apart.
+        assert!(gateway.begin_authentication("bbbbbbbbbbbbbbbbbbbb").is_ok());
+        drop(held.pop());
+        assert!(gateway.begin_authentication(DATABASE).is_ok());
+        drop(held);
+        assert!(gateway.admission.lock().unwrap().unauthenticated.is_empty());
     }
 
     fn ticket(route_revision: u64) -> WakeClaims {

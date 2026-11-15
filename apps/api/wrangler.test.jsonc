@@ -3,8 +3,9 @@
   "name": "pgcf-api-test",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-02",
-  // The daily infrastructure backup streams AES-256-GCM through node:crypto.
-  "compatibility_flags": ["nodejs_compat"],
+  // The daily infrastructure backup streams AES-256-GCM through node:crypto. global_fetch_strictly_public
+  // sends a fetch to a hostname of this Worker's own zone over the public path, as a tenant's webhook URL needs.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
   "d1_databases": [
     {
@@ -31,6 +32,17 @@
     // another test. The tests of the keep-warm arm it with an interval of their own.
     "DATABASE_ACTOR_WARM_INTERVAL_MS": "0",
   },
+  // High here: the suite's requests share one test address, and the limit is exercised with a limiter of its own.
+  "ratelimits": [
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "7",
+      "simple": {
+        "limit": 100000,
+        "period": 60,
+      },
+    },
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "NODE_ACTOR", "class_name": "NodeActor" },

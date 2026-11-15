@@ -19,6 +19,8 @@ export interface DatabaseActorNamespace {
 
 export interface Env {
   readonly DATABASE_ACTOR: DatabaseActorNamespace;
+  /** Every route of one source network together, whatever database it names (`admission.ts`). */
+  readonly SOURCE_RATE_LIMITER: RateLimit;
   readonly CONNECTION_RATE_LIMITER: RateLimit;
   /** Callers on a service binding (no CF-Connecting-IP), per database and role. */
   readonly BINDING_CONNECTION_RATE_LIMITER: RateLimit;
@@ -26,7 +28,8 @@ export interface Env {
   readonly ROUTE_MASTER_KEYS: string;
   /**
    * The Cloudflare Access service token that the Edge presents to a gateway on the public network:
-   * both secrets or neither. A gateway on a service binding does not go through Access.
+   * both secrets, which a public gateway requires. A gateway on a service binding does not go
+   * through Access.
    */
   readonly ACCESS_CLIENT_ID?: string;
   readonly ACCESS_CLIENT_SECRET?: string;

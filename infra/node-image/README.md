@@ -87,7 +87,10 @@ secret, so it uploads nothing to R2 and registers nothing: that is the operator'
 
 The CI job `advisories` runs `advisories` every day at 05:23 UTC (the workflow's `schedule`) and on a
 manual dispatch with the input `advisories`; the other jobs skip on both. A red run means that a
-Debian security update, a `trixie-updates` change or a PGDG release is waiting for a new lock.
+Debian security update, a `trixie-updates` change or a PGDG release is waiting for a new lock, or that
+an advisory is open: the same job also runs `pnpm audit --prod` and `cargo audit` (cargo-audit at
+`nativeRuntime.cargoAuditVersion` in `infra/platform/versions.lock.json`), each whatever the others
+report, and a red audit is a notice, not a release gate. Read the step that is red.
 
 ## Registering a release
 
@@ -404,7 +407,7 @@ package from creating a default cluster.
   `Restart=no`: every start goes through the agent's admission.
 - **Limits:** `MemorySwapMax=0`, `TasksMax=64` and, until the agent applies the database's size, the
   smallest class (`MemoryMax=256M`, `MemoryHigh=230M`). The agent sets `MemoryMax`, `MemoryHigh` (90 %),
-  `CPUWeight`, `IOWriteBandwidthMax`, `IOWriteIOPSMax` and `TasksMax` as persistent unit properties
+  `CPUWeight`, `IOWriteBandwidthMax`, `IOWriteIOPSMax`, `IOReadBandwidthMax`, `IOReadIOPSMax` and `TasksMax` as persistent unit properties
   (`SetUnitProperties`), never by `daemon-reload`. `CPUQuota` is set only after ready (for a wake, after the policy's `cpu_boost_ms`, so that the
   start-up and the first requests are not throttled) and cleared
   at stop with the empty assignment `CPUQuota=` (`CPUQuotaPerSecUSec` = `UINT64_MAX` over D-Bus

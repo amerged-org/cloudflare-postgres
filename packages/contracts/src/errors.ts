@@ -64,6 +64,7 @@ export const TERMINAL_ERROR_REASONS = [
   "role_has_members",
   "archive_expired",
   "archive_unusable",
+  "archive_digest_mismatch",
   "no_recovery_point",
   "source_unavailable",
   "region_unavailable",
@@ -83,7 +84,7 @@ export const ERROR_REASONS = [
 export const ErrorReason = z.enum(ERROR_REASONS).meta({
   id: "ErrorReason",
   description:
-    "Stable cause of a refusal. Retryable: mutation_in_progress, generation_changed, not_ready, operation_in_progress, node_capacity; these answers carry a Retry-After header. Terminal: name_in_use, database_deleted, project_not_empty, role_exists, role_limit, role_being_deleted, role_has_members, archive_expired, archive_unusable, no_recovery_point, source_unavailable, region_unavailable, storage_not_local.",
+    "Stable cause of a refusal. Retryable: mutation_in_progress, generation_changed, not_ready, operation_in_progress, node_capacity; these answers carry a Retry-After header. Terminal: name_in_use, database_deleted, project_not_empty, role_exists, role_limit, role_being_deleted, role_has_members, archive_digest_mismatch, archive_expired, archive_unusable, no_recovery_point, source_unavailable, region_unavailable, storage_not_local.",
 });
 export type ErrorReason = z.infer<typeof ErrorReason>;
 

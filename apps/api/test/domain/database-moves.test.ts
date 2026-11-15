@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { reportedBackup } from "./fixtures.ts";
 import {
   ArchiveCredential,
   DatabaseOrigin,
@@ -70,6 +71,7 @@ async function archive(f: { row: () => Promise<{ archive_path: string }> }) {
     segment = (n: string) =>
       `${prefix}wals/0000000100000000/0000000100000000000000${n}.gz`;
   for (const key of [info, data, segment("01"), segment("02")]) await put(key);
+  await reportedBackup((await f.row()).archive_path, BACKUP.backup_id);
   return { info, data, last: segment("02"), put };
 }
 async function ready() {
@@ -353,14 +355,14 @@ it("refuses a target that is not open for placement or has no room for the secon
     code: "conflict",
     details: { reason: "node_capacity" },
   });
-  // Nominal capacity also applies: 398 GiB of the 400 the target pool may sell are sold,
+  // Nominal capacity also applies: 148 GiB of the 150 the target pool may sell are sold,
   // and the database brings 5 more.
   const sold = await addNode(f.region);
   await seedSamples(sold, [
     {
       at: Date.now(),
       totalBytes: 8192 * MIB,
-      pool: { ...OPEN_POOL, nominal: 398 * GIB },
+      pool: { ...OPEN_POOL, nominal: 148 * GIB },
     },
   ]);
   await expect(start(f, sold)).rejects.toMatchObject({

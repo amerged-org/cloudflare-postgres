@@ -218,8 +218,7 @@ impl Decoy {
                     self.finish(&mut out, Some("28P01"));
                     break;
                 }
-                out.frames
-                    .push(authentication(10, "SCRAM-SHA-256-PLUS\0SCRAM-SHA-256\0\0"));
+                out.frames.push(authentication(10, "SCRAM-SHA-256\0\0"));
             }
             if self.buffer.len() < 5 {
                 break;
@@ -242,7 +241,16 @@ impl Decoy {
                     self.finish(&mut out, Some("28P01"));
                     break;
                 };
-                if &body[..end] != b"SCRAM-SHA-256" || body.len() < end + 5 {
+                if &body[..end] != b"SCRAM-SHA-256" {
+                    // PostgreSQL refuses a mechanism it did not offer with this error.
+                    self.finish(&mut out, None);
+                    out.frames.push(error_response(
+                        "08P01",
+                        "client selected an invalid SASL authentication mechanism",
+                    ));
+                    break;
+                }
+                if body.len() < end + 5 {
                     self.finish(&mut out, Some("28P01"));
                     break;
                 }

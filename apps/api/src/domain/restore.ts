@@ -35,7 +35,8 @@ import {
 import { publishForAnswer } from "./admission-mutations.ts";
 import { validatedArchivePrefix } from "./archive.ts";
 import { archiveBucket } from "./archive-bucket.ts";
-import { restoreBackup } from "./restore-catalog.ts";
+import { archiveCutoff, restoreBackup } from "./restore-catalog.ts";
+import { recordedDigests } from "./archive-digests.ts";
 import { retainedArchiveRestorable } from "./retained-archives.ts";
 interface Retained {
   roles_json: string;
@@ -195,11 +196,14 @@ export async function restoreDatabase(
         await regionBounds(c.env.DB, region.id),
       );
       const selected = archiveBucket(c.env),
-        prefix = validatedArchivePrefix(archiveSource, selected.bucketName);
+        prefix = validatedArchivePrefix(archiveSource, selected.bucketName),
+        fencedAt = await archiveCutoff(c.env.DB, source.node_id);
       const backup = await restoreBackup(
         selected.bucket,
         prefix,
         body.mode === "pitr" ? body.target_time : undefined,
+        fencedAt,
+        await recordedDigests(c.env.DB, archiveSource.archive_path),
       );
       const stored = retained
         ? (JSON.parse(retained.roles_json) as SourceRole[])

@@ -455,7 +455,7 @@ creates its database with the source's resources.
 
 The API refuses a class whose memory exceeds the region's per-database maximum (`400`; 4,096 MiB
 unless the operator sets another). It does **not** refuse a class that no node can host, for
-example a volume size that would take a node's sold storage past four times its pool, or a CPU
+example a volume size that would take a node's sold storage past 150 % of its pool, or a CPU
 size above the node's cores: creates of such a class are accepted and then wait unplaced. Ask the
 operator which classes are placeable.
 
@@ -627,11 +627,11 @@ pgcf -i -X POST "$PGCF_API/v1/databases" -H 'Content-Type: application/json' \
 
 What happens: the database record (generation 1) and the owner role `app` with a server-generated
 password are written; the
-placement step picks the fullest qualifying node. Its CPU peak (the highest 30-minute average of
+placement step picks the qualifying node holding the most placed memory. Its CPU peak (the highest 30-minute average of
 the last three days) must stay under 80 %, and the requested CPU must fit its physical cores.
 RAM uses the higher of its three-day peak and current sample, plus the full memory of databases
 placed since that sample and the requested database; the sum must stay under 80 %. Its thin pool is
-open (data below 80 %, metadata below 50 %, sold storage within four times its data), and the node
+open (data below 80 %, metadata below 50 %, sold storage within 150 % of its data), and the node
 holds fewer than 1,000 volumes. The node then creates the volume
 and the cluster, applies the roles, starts PostgreSQL through its own admission and takes the first
 base backup; WAL archiving starts with the first start. The database is ready only when that backup
@@ -728,6 +728,80 @@ pgcf "$PGCF_API/v1/databases/<database-id>/roles/web/connection-uri"
   `observed_generation == generation` before connecting as the new role (earlier: `57P03`). A
   hibernated database applies it at its next wake.
 - The URI has no port and no `sslmode`; see [3.1](#31-driver-configuration) for how to use it.
+
+**Large objects and WAL messages.** PostgreSQL lets every role create a large object (`lo_create`,
+`lo_creat`, `lo_from_bytea`) and write a WAL record (`pg_logical_emit_message`, in two forms), and
+neither needs a table privilege. A large object is persistent state, and a role that owns one
+cannot be dropped. A WAL record goes to the volume and to the archive: one call wrote
+1,000,000,000 bytes when measured, and nothing limits how often a login may call it. PGCF
+therefore revokes these five functions from `PUBLIC` and grants them to `app` WITH GRANT OPTION.
+The node agent does this as the superuser in each database's own catalog, as part of installing
+the platform schema `pgcf`.
+
+- **When.** At creation, and at every restore, replacement and move. For a database that exists, at
+  its next platform-schema install or refresh after the node release that carries this: its next
+  wake when it is hibernated, and the next pass of the node's event drain after the agent restarts
+  into the release when it is running. A database that never wakes is not changed. The release raises
+  the schema revision from 1 to 2, so every existing database runs the whole install once more (its
+  outbox rows stay); a database whose record is already revision 2 opens no session for it.
+- **What a role sees.** A role that calls these functions gets `42501` from the moment its database
+  is hardened. `app` gives it back: `GRANT EXECUTE ON FUNCTION pg_catalog.lo_from_bytea(oid, bytea)
+  TO <role>` (`lo_create(oid)` and `lo_creat(integer)` the same way), and
+  `GRANT EXECUTE ON FUNCTION pg_catalog.pg_logical_emit_message(boolean, text, text, boolean) TO <role>`
+  with `(boolean, text, bytea, boolean)` for the other form. The grant is kept in the database like
+  any other, so a restore to a point in time returns it as it was then, and `app` revokes it
+  before a role that holds it is deleted (a privilege holder is `role_not_droppable`).
+- **Order.** `app` holds no grant option before the baseline is applied, so grant onward only after
+  the release has reached the database; until then a role that calls these functions still can.
+- **If the baseline fails.** Because the revision went from 1 to 2, every existing database runs the
+  baseline before the platform-schema install may proceed (`pgcf.rs:133`; `build.rs:427-437`). An error
+  ends the install there: the record stays at revision 1 (`build.rs:365-368` is not reached), the
+  database keeps serving with PostgreSQL's defaults, and no wake is refused (`power.rs:537`,
+  `power.rs:922`). What happens to data events, from the code:
+  - **The outbox.** The old schema and its rows stay untouched, and `pgcf.emit` and the capture
+    triggers keep writing to it (revision 1 and 2 are the same schema). Only the drain deletes rows
+    (`pgcf.rs:224`), and it does not run, so events are delayed, not lost.
+  - **The drain.** A drain exists only in the agent process's memory (`drains.rs:28-35`, `drains.rs:101-105`)
+    and ends with it. The release that carries the baseline replaces the agent, so no old drain keeps
+    running on the old schema. A new drain attaches only after a refresh answers `Unchanged` or
+    `Installed` (`drains.rs:164-169`), and with the record at revision 1 that needs the install to
+    succeed: while the baseline keeps failing no drain attaches, after a restart as well, and each try waits
+    1 s, doubling to 60 s (`drains.rs:238-251`, `agent/mod.rs:159-160`). A drain already attached under
+    the new agent has a current record, and the baseline is not run for it again (`build.rs:420-421`,
+    `build.rs:427-436`).
+  - **Sleep and suspend.** A database whose outbox holds rows cannot sleep or be suspended: the proof
+    refuses with `power_outbox` (`proof.rs:94-111`), and the idle shortcut `outbox_backlog`
+    (`power.rs:1434`) knows only an attached drain.
+  - **A full outbox.** At the operator's row limit (10,000 by default) `pgcf.emit`, and so a write to a
+    watched table, fails with `53400` in the tenant's own transaction (`schema.sql:84`): the write is
+    refused and rolled back, not lost.
+  - **Recovery.** The next successful refresh (the next wake, or the drain's backoff while the database
+    runs) installs, records revision 2 and attaches a drain, which delivers what waited in sequence
+    order. A build at creation or restore fails instead.
+- **`app` can undo it.** `app` holds the grant option, so it can grant these functions to `PUBLIC`
+  again; that is by design, `app` being yours. The baseline runs at every install, but its `REVOKE`
+  is the superuser's and removes only the `PUBLIC` entries the function's owner granted: a grant to
+  `PUBLIC` that `app` made stays (`=X/app` in `proacl`) until `app` revokes it.
+- **Reviewed and left.** `lo_import` and `lo_export` are the superuser's already; `lo_put`, `lowrite`,
+  `lo_truncate` and `lo_unlink` need a large object the caller may change; the advisory-lock functions
+  take lock-table slots that `max_locks_per_transaction` caps; the replication-slot functions refuse a
+  role without `REPLICATION`; and `pg_notify` is the `NOTIFY` command, which no privilege guards, whose
+  queue `max_notify_queue_pages` caps at 8 GB by default and which a session that listens and holds a
+  transaction open can fill (156 MB for 20,000 notifications were measured; the files go when the
+  session ends).
+- **Temporary tables (revision 3).** The baseline also takes `TEMPORARY` on the database from `PUBLIC`
+  and keeps it with `app`, so a role that creates a temporary table gets `42501` from the moment its
+  database is hardened. `app` gives it back with `GRANT TEMPORARY ON DATABASE <db> TO <role>` for each
+  role that writes. Until that grant a writing role's temporary tables fail, so grant it before the
+  release reaches the database.
+- **Disk writes that remain.** One more path lets a `SELECT`-only login write to the volume, and this
+  baseline does not close it: `temp_file_limit` is unset (the default, -1), so a query can spill sort
+  and hash files to disk until it ends, bounded only by a `statement_timeout` (a role can change its
+  own) and the volume. What would close it: `ALTER DATABASE <db> SET temp_file_limit = '<size>'`, run by the
+  superuser (a superuser-only setting, so tenants cannot change it), with a value the node agent
+  derives from the volume size. What would close `pg_notify`: `max_notify_queue_pages` in
+  `apps/node-agent/src/settings.rs` (a cluster setting, which needs a restart). Neither is built here,
+  because the right value is a capacity decision for the owner.
 
 **Attributes at creation.** All are optional; a role created without them is the plain login role
 of before. None can be changed afterwards (there is no `PATCH`): delete the role and create it
@@ -865,7 +939,7 @@ its memory and CPU are admitted by its node then, while its storage growth must 
   grows must fit the node now, else `503 capacity_exhausted` ("Current node has insufficient
   memory, CPU or storage"): the node has no observation from the last 180 s, its active RAM would
   reach 80 % with the extra memory, its CPU would exceed the node's cores, or, for extra storage,
-  the node reports no thin pool or no room in it, or its sold storage would pass four times its
+  the node reports no thin pool or no room in it, or its sold storage would pass 150 % of its
   pool. A smaller or equal size needs no room. A hibernated database waits for its next wake only for
   memory and CPU; growth of its storage is sold from now on and is refused with the same `503` on
   the same storage test.
@@ -1079,6 +1153,7 @@ adoption paths; it does not claim a fresh live interruption of the narrow DONE-b
 | `archive_unusable`   | the v1 catalog reads at most 16,000 objects and 64 base backups per database, and the listing was incomplete, invalid or beyond that bound |
 | `name_in_use`        | a live database of the project already has the target `name`; choose another                                                               |
 | `source_unavailable` | the source's class is disabled, its region record is gone or its credentials are unavailable                                               |
+| `not_ready`          | the source's node was declared lost and its fence has not completed yet; retry after the `Retry-After` seconds                             |
 | `region_unavailable` | the `region_id` of the request is not the source's own region (a restore stays in the source's region)                                     |
 | `generation_changed` | the source, its retained archive or the placement changed under the request; retry                                                         |
 
@@ -1212,7 +1287,12 @@ curl -sS -X POST https://api.example.org/v1/webhooks -H "Authorization: Bearer $
     before you act on an event that matters.
   - **Dumps.** A logical dump of your database needs `pg_dump --exclude-schema=pgcf`: the platform schema is
     readable only by the platform, so a dump that includes it fails. The platform installs its schema again when
-    a database is created or restored.
+    a database is created or restored. To restore the dump into another PGCF database as `app`, add
+    `--exclude-schema=pg_catalog` as well: the dump otherwise carries the baseline's grant of the large-object and
+    WAL-message functions to `app` ([2.3](#23-roles-connection-uri-and-passwords)), which `app` cannot repeat in a
+    database that has it ("grant options cannot be granted back to your own grantor"). That option removes the
+    whole entry for the five functions, including the grants you made onward to your roles: after such a restore,
+    grant them again as `app`.
   - **Deletion.** Deleting a database dead-letters its waiting data deliveries once the API reads the `database.deleted`
     event (within the minute cron). They can be replayed for seven days; platform events of the database keep
     being delivered.
@@ -1344,8 +1424,10 @@ SQL and allows 16 local connections.
 - The StartupMessage must arrive within 10 s of the upgrade and is at most 10,000 bytes. A
   password pipelined with it is a PasswordMessage of at most 4,096 bytes; an empty, oversized or
   wrong one, an unknown role and an unknown database are all answered with the same `28P01`.
+- A login that does not complete within 10 s of the gateway's first write to PostgreSQL ends the
+  connection with `08006`.
 - The gateway logs in with a pipelined password (and over HTTP) only to a PostgreSQL that asks for
-  SCRAM-SHA-256 with at most 100,000 iterations (PostgreSQL's default `scram_iterations` is
+  SCRAM-SHA-256 with at most 16,384 iterations (PostgreSQL's default `scram_iterations` is
   4,096), or for no password; anything else answers `08006` and never receives the password.
 
 ### 3.3 TLS
@@ -1517,6 +1599,7 @@ second, [4.4](#44-capacity-caps)).
 | Server sessions | the class's `max_connections` (`xs` 20, `sm` 100, `md` 200, `lg` 300); PostgreSQL reserves a few for superusers (the node agent connects as one) | PostgreSQL; refusal is `53300` |
 | Sessions of one role | the role's `connection_limit` when set ([2.3](#23-roles-connection-uri-and-passwords)) | PostgreSQL; refusal is `53300` "too many connections for role" |
 | Sessions per database through one gateway | 200 (2,000 per gateway), including parked HTTP-SQL backend sessions; a WebSocket connection beyond the cap fails as `08006` | fixed native gateway constants; no count override |
+| New requests per source network, across all databases and roles, for WebSocket handshakes and HTTP queries | 600 per 60 s (example value, a product default) | Edge rate limiter `SOURCE_RATE_LIMITER`, counted first, before any DatabaseActor is got or any HTTP body is read; for one public source it binds before the two per-role limits below, so it is the figure to raise for a busy single-origin client; the Rust edition has no such limiter yet; refusal is `53300` |
 | New connections per database, all roles and networks | 12,000 per 60 s (**Dev value**) | Edge rate limiter `DATABASE_CONNECTION_RATE_LIMITER`; refusal is `53300` |
 | New connections per database, role and source network | 6,000 per 60 s (**Dev value**) | Edge rate limiter `CONNECTION_RATE_LIMITER`; refusal is `53300` |
 | New connections per database and role from a same-account Worker on a service binding (no `CF-Connecting-IP`) | 12,000 per 60 s (**Dev value**), in a limiter of its own; such a caller never counts in the two public limiters above | Edge rate limiter `BINDING_CONNECTION_RATE_LIMITER`; refusal is `53300` |
@@ -1524,7 +1607,7 @@ second, [4.4](#44-capacity-caps)).
 | Waiters during a fallback Actor wake | 32 per database | DatabaseActor |
 | Held native wake connections | 32 per database, 512 per gateway; 25 s bound | native gateway wake queue |
 | Simultaneous request handshakes | 128 per gateway; not a running-query concurrency limit | native gateway |
-| Accounted gateway buffer bytes | 192 MiB total, 96 MiB per database on both nodes; a session reserves a 144-KiB base lease | native gateway; both environment overrides absent in the October 26 snapshot |
+| Accounted gateway buffer bytes | 192 MiB total, 96 MiB per database; 96 MiB of the total is a reserve that a database draws on only while it holds no more than its 3 MiB guaranteed share, so databases above their share compete for the other 96 MiB, and one database can occupy all of it (refusing other databases' answers above their 3 MiB share while that lasts; sessions within the share keep working); the reserve covers 32 databases at or below their share, and beyond 32 the guarantee degrades (a database at its share may be refused while the shared part is full; the gateway logs `memory_reserve_outgrown`; the memory rule `measured`, the plan's default, does not cap awake databases, and under `reserved` about 37 are awake on a 12 GB node; to cover more the operator raises the total and then the reserve by 3 MiB for each database, which adds that much to the memory the gateway may use); a session reserves a 144-KiB base lease | native gateway; in the October 26 snapshot both overrides were absent and there was no reserve (192 / 96 MiB only); the reserve and the share are `PGCF_GATEWAY_RESERVE_BYTES` and `PGCF_GATEWAY_GUARANTEED_BYTES` |
 | HTTP-SQL idle backend pool | Four per database/role; 10 s idle and 60 s lifetime | native gateway |
 
 **The four rate values are the Dev installation's.** They were read from its Edge and API
@@ -1595,9 +1678,9 @@ const [, total] = await sql.transaction(
 | Not supported            | `COPY` (`0A000`); `authToken` / `Authorization` (`0A000`); clients other than the driver must send `Neon-Raw-Text-Output: true` and `Neon-Array-Mode: true`.                                                                                                                                                                                                                                                                                                  |
 | Limits                   | Request body 4 MiB, at most 256 statements per transaction, answer 10 MiB of JSON (`54000`; the session is closed and the outcome is unknown).                                                                                                                                                                                                                                                                                                                |
 | Sleeping database        | The request waits for the wake as a connection does ([3.4](#34-timeouts-and-retries-for-a-sleeping-database)): at most 60 s, with the same `57P03` and `08006` answers. Set your `fetch` timeout accordingly.                                                                                                                                                                                                                                                 |
-| Admission and limits     | Every request is one admission. It counts in the same Edge rate limiters as a connection (a service-binding caller in its own limiter), in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the Dev values of [3.6](#36-connection-limits) that is 12,000 requests per 60 s per database and 6,000 per database, role and source network, counted per Cloudflare location. |
+| Admission and limits     | Every request is one admission. It counts in the same Edge rate limiters as a connection (a service-binding caller in its own limiter), in buckets of its own (WebSocket handshakes are never used up by queries), and in the admissions per database per minute ([3.6](#36-connection-limits)). With the Dev values of [3.6](#36-connection-limits) that is 12,000 requests per 60 s per database and 6,000 per database, role and source network, counted per Cloudflare location. The limiters count a request from its headers, before its body is read: a client over its budget is refused with `53300` without a read of its body, and a malformed or oversized body still uses up one request of the budget. |
 | Errors                   | HTTP 400 with PostgreSQL's error fields (`message`, `code`, `severity`, `detail`, `hint`, `position`, ...); the driver throws them as `NeonDbError`. Admission refusals use the codes of [A.4](#a4-sqlstate-at-connect-time).                                                                                                                                                                                                                                 |
-| Unknown outcome          | `08007`: the connection to PostgreSQL ended, or the gateway's answer was lost, after the request was sent. PGCF never sends a request twice and does not know whether a write took effect; retry only idempotent requests.                                                                                                                                                                                                                                    |
+| Unknown outcome          | `08007`: the connection to PostgreSQL ended, the gateway's answer was lost, or the gateway had no memory left for the answer, after the request was sent. PGCF never sends a request twice and does not know whether a write took effect; retry only idempotent requests.                                                                                                                                                                                     |
 | Password change          | A kept session is reused only for the password it authenticated with, and at most 60 s after its authentication: an old password can still succeed for up to 60 s after a password change.                                                                                                                                                                                                                                                                    |
 | Unknown database or role | Answers `28P01` "password authentication failed" at once, while a wrong password is checked by PostgreSQL: unlike the WebSocket path, the response time differs.                                                                                                                                                                                                                                                                                              |
 
@@ -1681,8 +1764,8 @@ XS database and its SM resize, not a reservation of physical RAM against every o
 
 | Class | MemoryMax | MemoryHigh | CPU ceiling | Write bandwidth | Write IOPS | Swap | Read limits |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| XS | 256 MiB | 230 MiB | 0.25 CPU | 8 MB/s | 1,000 | 0 | uncapped |
-| SM | 1,024 MiB | 921 MiB | 0.5 CPU | 32 MB/s | 4,000 | 0 | uncapped |
+| XS | 256 MiB | 230 MiB | 0.25 CPU | 8 MB/s | 1,000 | 0 | 32 MB/s, 4,000 IOPS |
+| SM | 1,024 MiB | 921 MiB | 0.5 CPU | 32 MB/s | 4,000 | 0 | 128 MB/s, 16,000 IOPS |
 
 The SM resize, manual-suspend refusal and explicit resume passed, with the source's 100 markers
 and the witness's 337 full rows subsequently verified. These observations do not close pool-full,
@@ -1749,9 +1832,9 @@ other classes are not converted into unmeasured regional passes.
 Every database lives on its own thin LVM volume of its node's one thin pool. The volume's size is
 the database's nominal volume size (`storage_mib`, or the equivalent legacy `storage_gib`), real space is taken only as the database writes (an empty database
 used 68.6 MiB when it was ready on EU1, 2026-10-17, "Stage 1 Block 2: create and sleep costs"), and the pool does not grow. Sold sizes do not reserve
-space: the sizes of the volumes on a node may add up to more than its disk, within a cap of four
-times the pool's physical data area. Report physical pool bytes, nominal allocated volume bytes
-and the sold-storage admission cap separately; the four-times cap is not additional disk or a
+space: the sizes of the volumes on a node may add up to more than its disk, within a cap of 150 %
+of the pool's physical data area. Report physical pool bytes, nominal allocated volume bytes
+and the sold-storage admission cap separately; the 150 % cap is not additional disk or a
 measured workload envelope. Chunks are zeroed before reuse, so space freed by one database is never
 readable by another.
 
@@ -1780,7 +1863,9 @@ readable by another.
   and grows before unproven crash recovery. It imposes no tenant project quota or hidden usable-space
   reserve, and does not promise arbitrary DELETE/VACUUM/TRUNCATE while no space is available.
 - **Write limits.** Each database's write bandwidth and IOPS are capped by its size, which bounds
-  how fast one tenant can fill the pool.
+  how fast one tenant can fill the pool. Its read bandwidth and IOPS are capped at four times those
+  write limits (`READ_FACTOR` in `apps/node-agent/src/units/limits.rs`), so one tenant cannot saturate
+  the node's shared disk with reads; the factor is not measured against cold wakes yet.
 - **Measured storage acceptance (Stage 5.5).** EU1 passed byte/inode exhaustion and 2-to-5-GiB
   growth, with exact 29/109 acknowledged writes. US1 reached physical pool full, new allocations
   failed, and deleting only its owned filler restored space. All 1,789 ledger acknowledgements
@@ -1804,7 +1889,7 @@ What bounds a node, with the kind of each value as in the header.
 | Node size | 6 vCPU, 12 GB RAM (11,967 MiB visible on EU1) and a thin pool of about 289 GiB | measured: US1 reported 11,966 MiB, 6,000 millicores and 289 GiB (2026-10-22, "US1 installed into `us-dev` from the image") |
 | Placement RAM and CPU limits | Below 80 %: CPU uses the highest 30-minute average of the last 3 days; RAM uses max(three-day peak, current sample) plus pending placements and the new database's full memory. Requested CPU must fit physical cores | decided: the owner's rule of 2026-10-17 and its window of 3 days on 2026-10-23 (plan 11.3, "2026-10-17" and "2026-10-23"); see [2.1](#21-create) |
 | Pool closed for placement at | 80 % of its data or 50 % of its metadata | decided: the 80 % is the owner's number, the 50 % a plan default (plan 4.3) |
-| Sold storage per node | at most 4 times the pool's data (about 1,150 GiB on EU1) | decided: plan default, operator-configurable (plan 11.4, "Logical cap of 4 × pool, operator-configurable") |
+| Sold storage per node | at most 150 % of the pool's data (about 430 GiB on EU1) | decided 2026-11-10 in the security review (pgcf-compute-1), lowered from the plan default of 4 × pool (plan 11.4): one constant in `apps/api/src/domain/placement.ts` (`LOGICAL_CAP_PERCENT`) and `logical_cap_percent` in the node agent's storage configuration |
 | Volumes per node | 1,000 | measured on 2026-10-17: the largest count tested, `lvcreate` p50 about 270 ms at 1,000 volumes ("Stage 1 Block 1: LVM at scale"); placement closes a node at 1,000 volumes (built 2026-10-20 and in the API deployed on 2026-10-22: "Placement closes a node at 1,000 volumes, and the capacity cron reserves no order while purchases are off"; "Release of main `69d2b245` live on EU1"). It is a technical bound, raised only after a measurement at a higher count, not a sales limit |
 | Volumes carried so far | up to 301 on EU1 (2026-10-19 and 2026-10-20), 167 on 2026-10-23 | measured: a count carried, not a cap ("Placement closes a node at 1,000 volumes, and the capacity cron reserves no order while purchases are off"; "Live acceptance on the slot-pool release, part 1") |
 | Starts at once | 8 on EU1 | node policy, set 2026-10-20 ("Stage 5.6 wake storm, first measurement") |
@@ -2224,12 +2309,12 @@ of the row of the plan's
 | Early sleep (D2) | Only while a wake waits for room, one per waiting wake, never with client activity in the last 30 s, never an always-warm database; the wake that waited takes seconds and is counted in the p95. A full sleep proof took 1,016.6 ms at p50 and 1,084.4 ms at p95 | decided: plan default D2, not named otherwise by the owner; proof time measured 2026-10-17; counts under load **to be measured** (Stage 5.6) | "Stage 1 Block 2: create and sleep costs"; plan 11.5, D2 | [3.4](#34-timeouts-and-retries-for-a-sleeping-database), [4.2](#42-awake-databases-what-a-sold-memory-size-means) |
 | What a sold memory size means (D3) | A hard ceiling while awake, not a cross-tenant reservation under `measured`. Observed US1 leaf limits: XS 256/230 MiB Max/High, CPU 0.25, writes 8 MB/s and 1,000 IOPS; SM 1,024/921 MiB, CPU 0.5, writes 32 MB/s and 4,000 IOPS. Both have zero swap and uncapped reads | rule decided D3; these leaf limits measured 2026-10-25, not a complete density/OOM envelope | Dated ULTRA update; plan 11.5 D3 | [4.2](#42-awake-databases-what-a-sold-memory-size-means) |
 | Volume-full and pool-full behaviour | EU1 passed growth after byte/inode exhaustion with exact 29/109 acknowledgements. US1 reached physical pool full: new allocations failed while the mapped ledger kept 41 acknowledgements. Deleting only its filler restored space; all 1,789 acknowledgements matched. No universal all-writes-fail or damaged-filesystem-recovery claim follows | required cases measured 2026-10-25; owned cleanup complete | Dated ULTRA update; plan 4.3 | [4.3](#43-thin-storage), [7.1](#71-what-happens-in-each-situation) |
-| Connection limits | 12,000 new connections per 60 s per database; 6,000 per 60 s per database, role and source network; 12,000 per 60 s from a service binding; 12,000 admissions per minute per database; 32 waiters per wake; compiled native ceilings of 2,000 total / 200 sessions per database per gateway, including idle SQL sessions. Actual accounted buffer budgets are 192 MiB total / 96 MiB per database; these can refuse before count ceilings and are neither RSS limits nor usable concurrency guarantees | Dev values, recorded 2026-10-23; native source/runtime limits confirmed 2026-10-26; these carry into production acceptance unless the operator changes them and informs the integrator | "Dev connection limits recorded (S6-03)" | [3.6](#36-connection-limits) |
+| Connection limits | 12,000 new connections per 60 s per database; 6,000 per 60 s per database, role and source network; 12,000 per 60 s from a service binding; 12,000 admissions per minute per database; 32 waiters per wake; compiled native ceilings of 2,000 total / 200 sessions per database per gateway, including idle SQL sessions. Accounted buffer budgets are 192 MiB total / 96 MiB per database, of which 96 MiB is a reserve for databases within a 3 MiB guaranteed share (it covers 32 databases at or below their share; beyond that a database at its share may be refused while the shared part is full; one database can occupy all 96 MiB that are not reserve, and other databases' answers above 3 MiB are refused while that lasts); these can refuse before count ceilings and are neither RSS limits nor usable concurrency guarantees | Dev values, recorded 2026-10-23; native source/runtime limits confirmed 2026-10-26; these carry into production acceptance unless the operator changes them and informs the integrator | "Dev connection limits recorded (S6-03)" | [3.6](#36-connection-limits) |
 | Outage classes and maintenance windows | Idle sleep, suspend, maintenance, process/node failure, archive or storage failure, node loss and Cloudflare outage remain distinct. October 25 maintenance: US1 25.166 s; EU1 79 min 19.188 s with 69 due backups drained first; no reboot, exact data and signed OS pins preserved on both. These are load-specific observations. The prior operating default is Tuesday 02:00–04:00 UTC; owner waived operator-contact/maintenance-lead-time completion as a G11 gate | maintenance measured 2026-10-25; gate waiver 2026-10-25; historical window decisions retained | Dated ULTRA update; plan 11.3 D10 and 11.5 D15 | [7.1](#71-what-happens-in-each-situation) |
 | Security reboots | Within 7 days of a Debian security advisory that fixes the kernel, in an announced window (default Tuesday 02:00 to 04:00 UTC), one node at a time; every other reboot also needs the owner's go | decided 2026-10-19 (D10); window: plan default D15 | plan 11.3 (D10); plan 11.5 (D15) | [7.1](#71-what-happens-in-each-situation) |
 | IDs after restore, move and node loss | `/restore` creates a new ID; `/restore-in-place` retains ID and cached credentials. The four original SQL/API and native restore paths passed on both regions, including original-data recovery after a failed target. Move keeps ID; node-loss restoration uses new IDs. Bounded G9 queue/restart and US pool/R2-hard-cut acceptance passed; the owner accepted the cold-latency exception on October 26 | provider paths measured 2026-10-25; move/node-loss identity follows the existing decisions | Dated ULTRA update; plan 11.4 and D4 | [2.7](#27-backups-restorable-window-and-restore), [7.4](#74-eu1-lost) |
 | Losing a node | About 2.2 to 3.4 h for EU1's 167 databases and 23.4 GB if every restore succeeds: fence 30 s, reinstall 174 to 197 s, restores about 2.2 to 3.3 h. **7 of the 8 sample restores succeeded; the total assumes the `archive_unusable` defect is fixed** (failed-build/timeout fixes are deployed and bounded G9 queue/restart acceptance passed October 25; this extrapolation is not a measured full-node recovery bound) | extrapolated 2026-10-23 from a sample of restores; fence and reinstall measured 2026-10-19 and 2026-10-22; the full drill has not been run | "Live acceptance on the slot-pool release, part 1"; "G9: what is left after the 2026-10-19 loss and reinstall"; "US1 installed into `us-dev` from the image" | [7.3](#73-recovery-time), [7.4](#74-eu1-lost) |
-| Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 4 times the pool; 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | historical figures are not universal capacity guarantees. Required EU density/proof recovery, US 241-target population and regional storage/fault acceptance are accepted in the October 25–26 ULTRA ledger; post-cleanup free pool snapshot: EU1 271.292 GiB / US1 286.259 GiB, closed minute 10:40 UTC on October 26; both current placement previews idle | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
+| Capacity caps | Placement requires CPU's three-day peak and projected RAM below 80 % (RAM includes the higher of peak and current sample, pending placements and the new class); pool closed at 80 % data or 50 % metadata; sold storage at most 150 % of the pool (lowered from 4 times on 2026-11-10); 1,000 volumes; 8 starts at once on EU1; a storm of 40 wakes answered in at most 5.8 s (HTTP) and 7.1 s (WebSocket) with none refused | historical figures are not universal capacity guarantees. Required EU density/proof recovery, US 241-target population and regional storage/fault acceptance are accepted in the October 25–26 ULTRA ledger; post-cleanup free pool snapshot: EU1 271.292 GiB / US1 286.259 GiB, closed minute 10:40 UTC on October 26; both current placement previews idle | "Stage 1 Block 1: LVM at scale"; "Stage 5.6 wake storm, first measurement" | [4.4](#44-capacity-caps) |
 | Reserved role names | `postgres`, `pgcf_backup`, `public`, `none` and every name starting with `pg_` are refused (`400`); `streaming_replica`, `cnpg_*` and `pgcf_maintenance` are ordinary names | decided (W2-C/W2-C2), included in deployed baseline B with migration `0085`; the exercised regional role/connection receipts passed on October 25 and are reused; no new role-testing gate is added | Dated ULTRA baseline; `packages/contracts/src/ids-core.ts`; served OpenAPI `RoleName` | [2.3](#23-roles-connection-uri-and-passwords) |
 | Regions and the archive bucket | Two regions, `eu-dev` (EU1) and `us-dev` (US1), and one R2 archive bucket in the EU jurisdiction for both | measured 2026-10-22 and 2026-10-23 | "US1 installed into `us-dev` from the image"; "US1 database acceptance in `us-dev`"; "G8 one archive bucket: the cutover on Dev, steps 1 to 11" | [1.2](#12-regions) |
 | Placement window | 3 days (deployed in baseline B) | decided 2026-10-23 (O6, plan 11.3) | "Placement is closed for 3 days after a burst" (plan 11.2); plan 11.3 | [2.1](#21-create) |

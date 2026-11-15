@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import {
   DatabaseWithOperation,
+  ApiKeyCreated,
   ConnectionUri,
   TEXT_MAX_LENGTH,
   archiveDestinationPath,
@@ -242,6 +243,25 @@ describe("database domain on real Workers D1", () => {
     );
     expect(admin.includes_password).toBe(false);
     expect(admin.uri).not.toContain(password);
+    // A read-only administrator key sees no password either, and so no other administrator key.
+    const reader = ApiKeyCreated.parse(
+      await (
+        await request("/v1/api-keys", f.admin, "POST", {
+          name: "reader",
+          scope: "admin_read",
+        })
+      ).json(),
+    );
+    const readerUri = ConnectionUri.parse(
+      await (
+        await request(
+          `/v1/databases/${id}/roles/app/connection-uri`,
+          reader.key,
+        )
+      ).json(),
+    );
+    expect(readerUri.includes_password).toBe(false);
+    expect(readerUri.uri).not.toContain(password);
     const integrator = ConnectionUri.parse(
       await (
         await request(

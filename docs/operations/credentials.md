@@ -2,7 +2,7 @@
 
 Operational Cloudflare, R2 and PGCF credentials have no configured expiry in the current operator
 installation, except these: the Edge's Access service token below, the PGCF API keys, which carry
-an optional expiry ([API keys](#api-keys)), a node's temporary R2 credentials (7 days, renewed by
+an optional expiry ([API keys](#api-keys)), a node's temporary R2 credentials (7 days, or one hour for a restore's read, renewed by
 Cloudflare), the installer's enrollment token (30 minutes) and the route tokens (30 seconds). Keep
 their scopes limited to the account, buckets and services they use. Routing capabilities, control
 messages, provider access tokens and certificates retain their security deadlines.
@@ -10,14 +10,16 @@ messages, provider access tokens and certificates retain their security deadline
 ## API keys
 
 Using a working administrator key, call `POST /v1/api-keys` with an explicit `Idempotency-Key`.
-For a replacement administrator use `{"scope":"admin","name":"operator replacement"}`;
-integrator keys additionally require their existing `project_id`. Save the creation response
+For a replacement administrator use `{"scope":"admin","name":"operator replacement"}`. An integrator
+key is made with the owner credential (`BOOTSTRAP_TOKEN`), or by an integrator key of the same
+project; it requires the project's `project_id`. An administrator key never makes one. Save the creation response
 directly in private credential custody. The full key is returned once; replay does not reissue or
 silently replace it. Verify the replacement's scoped access, update the consumer, then revoke the
 old key with `DELETE /v1/api-keys/{id}`. Keep a working administrator throughout the change.
 
-`BOOTSTRAP_TOKEN` creates the first administrator key once and then answers `401`; it creates no
-integrator key and no second administrator.
+`BOOTSTRAP_TOKEN` creates the first administrator key once and then answers `401` for another
+administrator; it creates integrator keys for any existing project, with no idempotency record, so a
+retried request makes another key.
 
 **Scopes.** An operator holds keys of two scopes. `admin` changes anything: it buys servers, starts
 rollouts and maintenance, declares nodes lost and makes keys. `admin_read` reads what an
@@ -198,7 +200,8 @@ A node holds no secret of the image. Its credentials come from the install and f
   Tunnel, which ends the token, and then the DNS records that point at it.
 - **R2 credentials.** The Worker signs each node's temporary credentials locally from the parent key
   (`R2_PARENT_ACCESS_KEY_ID` and `R2_PARENT_SECRET_ACCESS_KEY`): one archive prefix of one
-  database generation, no delete right, 7 days, renewed after a third of that. Nodes never hold the
+  database generation, no delete right, 7 days for writes and one hour for a restore's read, each
+  renewed after a third of its own lifetime. The Worker delivers a read only while the restore or move that reads that source runs on the node. Nodes never hold the
   parent key or a bucket-wide key. To replace the parent key, create the new R2 API token (object
   read and write on the archive bucket), set both Worker secrets and deploy; credentials delivered
   afterwards are signed with the new key. Delete the old token only after the credentials it signed
@@ -206,7 +209,9 @@ A node holds no secret of the image. Its credentials come from the install and f
   base backup, a WAL archive and a restore read on the new key
   ([the bucket move](operator-installation.md#moving-to-another-archive-bucket), step 11): deleting it
   earlier ends the credentials the nodes hold, and archiving fails until they read new ones
-  (`database_archive_failing`).
+  (`database_archive_failing`). A fenced node's credentials stay valid until they expire, up to 7
+  days after the fence; deleting the old parent token ends them at once. Replacing the parent key is
+  the operator's planned step when compromise is suspected ([recovery](recovery.md#lost-node)).
 
 ## Provider and account credentials
 

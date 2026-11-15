@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { ApiError } from "../api-error.ts";
+import {
+  backupDigest,
+  type ArchiveDigests,
+  digestMismatch,
+  type ArchivedObject,
+} from "./archive-digests.ts";
 const WAL = /^[0-9A-F]{24}$/;
 const BACKUP = /^[0-9]{8}T[0-9]{6}$/;
 const CATALOG_PAGE_LIMIT = 16,
@@ -90,14 +96,62 @@ export interface RestoreCatalog {
   backups: RestoreBackup[];
   /** When the newest archived WAL segment was uploaded; null while there is none. */
   newestWalAt: string | null;
+  /**
+   * When the newest object of each base backup was uploaded, in milliseconds, as R2 records it. The
+   * node writes the descriptor and the data, but not this time.
+   */
+  uploaded: ReadonlyMap<string, number>;
+  /** The recorded backups whose objects no longer match their digest: left out of `backups`, never deleted. */
+  mismatched: string[];
 }
 
-/** Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. */
+/**
+ * The instant a node was fenced (its instance powered off), as SQL over `node`; NULL while the node
+ * is not lost or not yet fenced. Every archive cutoff and retained-archive purge reads it this way.
+ */
+export const fencedAtSql = (node: string) =>
+  `(SELECT l.powered_off_at FROM node_losses l WHERE l.node_id=${node})`;
+
+/**
+ * The upload cutoff for reading the archive a node wrote: its fence time, or undefined when the node
+ * is not lost. A node that is lost but not yet fenced can still write, so its archive is refused until the
+ * fence completes (retryable, `not_ready`).
+ */
+export async function archiveCutoff(
+  db: D1Database,
+  nodeId: string | null,
+): Promise<string | undefined> {
+  if (nodeId === null) return undefined;
+  const loss = await db
+    .prepare("SELECT powered_off_at FROM node_losses WHERE node_id=?")
+    .bind(nodeId)
+    .first<{ powered_off_at: string | null }>();
+  if (loss && loss.powered_off_at === null)
+    throw new ApiError(
+      "conflict",
+      "The source node is lost and not yet fenced",
+      { reason: "not_ready" },
+    );
+  return loss?.powered_off_at ?? undefined;
+}
+
+/**
+ * Reads the bounded v1 catalog; an archive it cannot read completely is `archive_unusable`. With
+ * `notAfter` (a fence time), objects uploaded later are ignored: a fenced node can no longer write.
+ * With `digests` (see `recordedDigests`), a backup whose digest was recorded and no longer matches is
+ * left out and listed in `mismatched`, while the others are still offered. A backup that was never
+ * recorded is left out only once the archive is enforced. The digest reads every object under the
+ * backup, uploaded after the fence or not.
+ */
 export async function readRestoreCatalog(
   bucket: R2Bucket,
   prefix: string,
+  notAfter: string | undefined,
+  digests: ArchiveDigests,
 ): Promise<RestoreCatalog> {
+  const recorded = digests.recorded;
   const objects = new Map<string, R2Object>(),
+    everything: R2Object[] = [],
     cursors = new Set<string>();
   let cursor: string | undefined;
   for (let page = 0; page < CATALOG_PAGE_LIMIT; page++) {
@@ -111,6 +165,9 @@ export async function readRestoreCatalog(
         reason: "archive_unusable",
       });
     for (const o of result.objects) {
+      if (o.key.startsWith(`${prefix}base/`)) everything.push(o);
+      if (notAfter !== undefined && o.uploaded.getTime() > Date.parse(notAfter))
+        continue;
       if (
         !o.key.startsWith(prefix) ||
         objects.has(o.key) ||
@@ -138,6 +195,35 @@ export async function readRestoreCatalog(
       "Archive listing exceeds the bounded recovery catalog",
       { reason: "archive_unusable" },
     );
+  const uploaded = new Map<string, number>();
+  for (const [key, object] of objects) {
+    const base = /^base\/([0-9]{8}T[0-9]{6})\//.exec(key.slice(prefix.length));
+    if (base)
+      uploaded.set(
+        base[1]!,
+        Math.max(uploaded.get(base[1]!) ?? 0, object.uploaded.getTime()),
+      );
+  }
+  const byBackup = new Map<string, ArchivedObject[]>();
+  for (const o of everything) {
+    const id = /^base\/([0-9]{8}T[0-9]{6})\//.exec(
+      o.key.slice(prefix.length),
+    )?.[1];
+    if (id === undefined) continue;
+    byBackup.set(id, [
+      ...(byBackup.get(id) ?? []),
+      { key: o.key, size: o.size, etag: o.etag },
+    ]);
+  }
+  // A backup whose descriptor is gone is being deleted (the descriptor goes first): it has nothing to verify.
+  const mismatched = new Set<string>();
+  for (const [id, listed] of byBackup)
+    if (
+      recorded.has(id) &&
+      listed.some((o) => o.key === `${prefix}base/${id}/backup.info`) &&
+      (await backupDigest(listed)) !== recorded.get(id)
+    )
+      mismatched.add(id);
   const walNames = new Set<string>();
   const walObjects = new Map<string, R2Object>();
   for (const key of objects.keys()) {
@@ -163,6 +249,8 @@ export async function readRestoreCatalog(
       key.slice(prefix.length),
     );
     if (!match) continue;
+    if (digests.enforced && !recorded.has(match[1]!)) continue;
+    if (mismatched.has(match[1]!)) continue;
     if (++metadataCount > 64)
       throw new ApiError(
         "conflict",
@@ -192,23 +280,35 @@ export async function readRestoreCatalog(
       newestWal === undefined
         ? null
         : walObjects.get(newestWal)!.uploaded.toISOString(),
+    uploaded,
+    mismatched: [...mismatched].sort(),
   };
 }
 
 export async function restoreBackup(
   bucket: R2Bucket,
   prefix: string,
-  target?: string,
+  target: string | undefined,
+  notAfter: string | undefined,
+  recorded: ArchiveDigests,
 ): Promise<RestoreBackup> {
-  const { backups } = await readRestoreCatalog(bucket, prefix);
+  const { backups, mismatched } = await readRestoreCatalog(
+    bucket,
+    prefix,
+    notAfter,
+    recorded,
+  );
   const selected = backups.find(
     (backup) => target === undefined || backup.end <= target,
   );
-  if (!selected)
+  if (!selected) {
+    // Refused as changed only when no trusted backup is left to restore from.
+    if (backups.length === 0 && mismatched.length > 0) throw digestMismatch();
     throw new ApiError(
       "conflict",
       "No complete base backup and required WAL are available for the requested recovery",
       { reason: "no_recovery_point" },
     );
+  }
   return selected;
 }

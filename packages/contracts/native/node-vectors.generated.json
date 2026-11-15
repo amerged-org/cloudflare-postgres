@@ -20144,6 +20144,34 @@
     },
     {
       "schema": "NodeSample",
+      "name": "total-above-the-bound",
+      "valid": false,
+      "node_valid": false,
+      "refinement": false,
+      "value": {
+        "observed_at": "2026-10-17T12:00:00.000Z",
+        "memory": { "total_bytes": 1099511627777, "available_bytes": 0 },
+        "cpu": { "cores": 6, "busy_millicores": 1200 },
+        "pool": {
+          "observed_at": "2026-10-17T12:00:00.000Z",
+          "data_total_bytes": 134217728000,
+          "data_used_bytes": 42949672960,
+          "metadata_total_bytes": 1073741824,
+          "metadata_used_bytes": 1048576,
+          "nominal_bytes": 322122547200
+        },
+        "room": true,
+        "volumes": { "total": 300, "mounted": 280 },
+        "archive": { "ready_files": 3, "oldest_ready_seconds": 42 },
+        "awake": ["dbbbbbbbbbbbbbbbbbbb"],
+        "awake_memory_mib": 256,
+        "starting": 0,
+        "queued": 1,
+        "credentials_revision": 3
+      }
+    },
+    {
+      "schema": "NodeSample",
       "name": "busy-above-cores",
       "valid": false,
       "node_valid": false,

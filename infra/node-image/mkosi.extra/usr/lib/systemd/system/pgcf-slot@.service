@@ -41,6 +41,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=notify
+# The database's own log budget (pgcf-pg@.service): the supervisor's unit logs what the postmaster does.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=1000
 NotifyAccess=main
 User=pgcf-slot-%i
 Group=pgcf-slot-%i
