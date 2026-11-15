@@ -162,5 +162,7 @@ erDiagram
 - [apps/api/migrations/0096_execution_usage.sql:1](../../../apps/api/migrations/0096_execution_usage.sql#L1)
 - [apps/api/migrations/0097_webhook_test_throttle.sql:1](../../../apps/api/migrations/0097_webhook_test_throttle.sql#L1)
 - [apps/api/migrations/0098_cold_storage.sql:1](../../../apps/api/migrations/0098_cold_storage.sql#L1)
+- [apps/api/migrations/0099_archive_backup_digests.sql:1](../../../apps/api/migrations/0099_archive_backup_digests.sql#L1)
+- [apps/api/migrations/0100_archive_digest_backfill.sql:1](../../../apps/api/migrations/0100_archive_digest_backfill.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.
