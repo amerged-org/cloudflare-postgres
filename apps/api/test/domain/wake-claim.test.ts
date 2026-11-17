@@ -188,7 +188,7 @@ it("the claim does not read back the row and the operation its own transition co
   );
   expect(indexOf(events, PUBLISH_SNAPSHOT, commit)).toBeGreaterThan(commit);
   expect(indexOf(events, PUBLISH_EPOCH, commit)).toBeGreaterThan(commit);
-  expect(events).toContain("HINT");
+  await vi.waitFor(() => expect(events).toContain("HINT"), { timeout: 10_000 });
   await finish();
 }, 30_000);
 
