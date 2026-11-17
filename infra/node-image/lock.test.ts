@@ -49,10 +49,12 @@ test("the committed lock is complete and pinned", () => {
 
 test("the lock pins the plan's component versions", () => {
   const version = (name: string) => lock.packages.find((entry) => entry.name === name)?.version;
-  assert.equal(version("postgresql-18"), "18.6-1.pgdg13+2");
-  assert.equal(version("postgresql-18-pgvector"), "0.8.7-1.pgdg13+1");
+  assert.equal(version("postgresql-18"), "18.7-1.pgdg13+2");
+  assert.equal(version("postgresql-client-18"), "18.7-1.pgdg13+2");
+  assert.equal(version("libpq5"), "18.7-1.pgdg13+2");
+  assert.equal(version("postgresql-18-pgvector"), "0.8.7-1.pgdg13+2");
   assert.equal(version("barman-cli-cloud"), "3.20.1-1.pgdg13+1");
-  assert.equal(version("cloudflared"), "2026.10.0");
+  assert.equal(version("cloudflared"), "2026.11.1");
 });
 
 test("index stanzas parse into checksummed records, ignoring continuation lines", () => {

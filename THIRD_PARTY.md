@@ -15,11 +15,11 @@ Pinned Rust, Edge build and CI toolchain versions are in [infra/platform/version
 | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | [PostgreSQL](https://www.postgresql.org/)                                                 | [PostgreSQL License](https://www.postgresql.org/about/licence/)                          | The database engine, unmodified (18.x); the node image installs the PGDG packages.                                                      |
 | [Barman / barman-cloud](https://github.com/EnterpriseDB/barman)                           | [GPL-3.0](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/LICENSE) (see note) | Backup tooling run unmodified on the node for base backups, WAL archiving and PITR to R2; not relicensed.                               |
-| [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE)           | Outbound Tunnel of each node; the node image pins its binary.                                                                           |
+| [cloudflared 2026.11.1](https://github.com/cloudflare/cloudflared/releases/tag/2026.11.1) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.11.1/LICENSE)           | Outbound Tunnel of each node; the node image pins its binary.                                                                           |
 | [Neon serverless driver](https://github.com/neondatabase/serverless)                      | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE)                      | Client library compatible with the edge endpoint (WebSocket `Pool`/`Client`). Used by clients and tests, not bundled into the platform. |
 
-**PostgreSQL test server:** CI installs PostgreSQL 18.6 from the PGDG apt repository, the
-`postgresql-18` and `postgresql-client-18` packages at `18.6-1.pgdg24.04+2`, verified by the
+**PostgreSQL test server:** CI installs PostgreSQL 18.7 from the PGDG apt repository, the
+`postgresql-18` and `postgresql-client-18` packages at `18.7-1.pgdg24.04+2`, verified by the
 repository key fingerprint `B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8`. It serves only the Rust
 tests of the gateway and the archive clients, which start real servers; it is in no PGCF image
 and on no node. The packages retain the PostgreSQL License and their own notices.
@@ -96,18 +96,18 @@ snapshot and on apt-archive.postgresql.org.
 
 | Component | License | Role |
 | --- | --- | --- |
-| [Debian 13 "trixie"](https://www.debian.org/) packages at snapshot `20261022T203737Z`, Linux 6.12.113 (`6.12.113-1`) | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
+| [Debian 13 "trixie"](https://www.debian.org/) packages at snapshot `20261117T204736Z`, Linux 6.12.117 (`6.12.117-1`) | Per package (DFSG); the kernel GPL-2.0 | Node operating system |
 | [systemd 257](https://github.com/systemd/systemd) (`257.13-1~deb13u1`) | LGPL-2.1-or-later | Units, sandboxing, cgroups, credentials, first-boot partitioning |
 | [GRUB 2](https://www.gnu.org/software/grub/) (`2.12-9+deb13u2`) | GPL-3.0-or-later | BIOS and UEFI boot loader |
-| [PostgreSQL 18.6](https://www.postgresql.org/) (PGDG `18.6-1.pgdg13+2`, with its `libpq5` pinned to the same version) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
-| [pgvector 0.8.7](https://github.com/pgvector/pgvector) (PGDG `0.8.7-1.pgdg13+1`) | PostgreSQL License | Extension |
+| [PostgreSQL 18.7](https://www.postgresql.org/) (PGDG `18.7-1.pgdg13+2`, with its `libpq5` pinned to the same version) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified |
+| [pgvector 0.8.7](https://github.com/pgvector/pgvector) (PGDG `0.8.7-1.pgdg13+2`) | PostgreSQL License | Extension |
 | [barman-cli-cloud 3.20.1](https://github.com/EnterpriseDB/barman) (PGDG `3.20.1-1.pgdg13+1`) | GPL-3.0 | WAL archive, base backup and restore to R2; run as a separate program, not linked |
-| [Python 3.13](https://www.python.org/) (`3.13.5-1`), [boto3 1.37.9](https://github.com/boto/boto3) and botocore (Debian `python3-boto3`, `python3-botocore`) | PSF-2.0; Apache-2.0 | The runtime barman-cloud runs on |
+| [Python 3.13](https://www.python.org/) (`3.13.5-2+deb13u5`), [boto3 1.37.9](https://github.com/boto/boto3) and botocore (Debian `python3-boto3`, `python3-botocore`) | PSF-2.0; Apache-2.0 | The runtime barman-cloud runs on |
 | [lvm2 2.03.31](https://sourceware.org/lvm2/) (`2.03.31-2`), [thin-provisioning-tools 1.1.0](https://github.com/jthornber/thin-provisioning-tools) (`1.1.0-4+b1`) | GPL-2.0, LGPL-2.1 / GPL-3.0 | Thin pool and volumes, run as separate programs |
 | [e2fsprogs 1.47.2](https://e2fsprogs.sourceforge.net/) (`1.47.2-3+b12`) | GPL-2.0 (programs), LGPL-2.0 (libraries) | ext4 of each database volume (`mkfs.ext4`, `e2fsck`, `tune2fs`), run as separate programs |
 | [OpenSSH 10.0](https://www.openssh.com/) (`1:10.0p1-7+deb13u4`) | BSD-style | sshd of the operator shell, loopback only |
 | [nftables 1.1.3](https://netfilter.org/projects/nftables/) (`1.1.3-1`) | GPL-2.0-only | The inbound-drop firewall |
-| [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE) | The node's Tunnel; release `.deb` pinned by sha256 `9721287c28f78cb623e77c7b95a63feea87e909054d75666a0ec9eff20e5d548` |
+| [cloudflared 2026.11.1](https://github.com/cloudflare/cloudflared/releases/tag/2026.11.1) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.11.1/LICENSE) | The node's Tunnel; release `.deb` pinned by sha256 `744ce90be92adb361103d51c85f78646314c47e4a68bbaadfe12ab5acc16c9b6` |
 | [mkosi v27.1](https://github.com/systemd/mkosi) (commit `ecf7f5702bb2052b7a69cab3fe7d37bc3b9ad77b`) | LGPL-2.1-or-later | Build tool only; not in the image |
 
 The PGDG archive signing key in [infra/node-image/keys/pgdg.asc](infra/node-image/keys/pgdg.asc)

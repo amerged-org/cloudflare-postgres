@@ -5,7 +5,7 @@
 # end-to-end package's tests need it; the job that runs either calls this script.
 set -euo pipefail
 
-PGCF_TEST_POSTGRESQL_VERSION=18.6-1.pgdg24.04+2
+PGCF_TEST_POSTGRESQL_VERSION=18.7-1.pgdg24.04+2
 PGCF_PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
 
 PGCF_PGDG_DIR="$RUNNER_TEMP/pgcf-pgdg"
