@@ -3,12 +3,15 @@ import { createRoute, type RouteConfig } from "@hono/zod-openapi";
 import {
   AUDIT_RETENTION_DAYS,
   AuditEvent,
+  CredentialDisclosure,
+  CredentialDisclosureListQuery,
   ErrorBody,
   ListQuery,
   listEnvelope,
 } from "@pgcf/contracts";
 import type { ApiApp } from "../app.ts";
 import { listAuditEvents } from "../domain/audit-events.ts";
+import { listCredentialDisclosures } from "../domain/credential-disclosures.ts";
 import type { ApiContext } from "../env.ts";
 
 const error = (description: string) => ({
@@ -51,5 +54,32 @@ export function registerAuditEvents(app: ApiApp): void {
       },
     },
     listAuditEvents,
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/credential-disclosures",
+      tags: ["API keys"],
+      security: [{ bearerAuth: [] }],
+      summary: "List authorized SQL credential releases",
+      description: [
+        "One event records the server's authorization to release a SQL password revision. It contains no password, URI or request headers.",
+        `List newest first with limit and cursor, optionally filtered by key_id. Events from the last ${AUDIT_RETENTION_DAYS} days are visible to admin and admin_read keys.`,
+      ].join("\n\n"),
+      request: { query: CredentialDisclosureListQuery },
+      responses: {
+        200: {
+          description: "Credential releases, newest first",
+          content: {
+            "application/json": { schema: listEnvelope(CredentialDisclosure) },
+          },
+        },
+        400: error("Invalid list query"),
+        401: error("Invalid credentials"),
+        403: error("Administrator scope required"),
+      },
+    },
+    listCredentialDisclosures,
   );
 }

@@ -3,7 +3,7 @@
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
 Each VPS is a self-contained Debian 13 (trixie) node installed from one image. Unmodified
-PostgreSQL 18.6 runs in sandboxed systemd slots, with one isolated instance and thin LVM volume
+PostgreSQL runs in sandboxed systemd slots, with one isolated instance and thin LVM volume
 per database, next to one Rust node agent. Server loss is recovered from R2.
 
 ## Stack
@@ -11,7 +11,7 @@ per database, next to one Rust node agent. Server loss is recovered from R2.
 | Part | Runtime |
 | --- | --- |
 | Node OS | Debian 13 (trixie), systemd, cgroup v2 |
-| Database | PostgreSQL 18.6 from pinned PGDG packages |
+| Database | PostgreSQL 18.7 pinned in the node image from PGDG packages |
 | First-party node binaries | Native Rust: `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive`, `pgcf-wal-fetch` |
 | Cloudflare management | TypeScript API Worker, Durable Objects, Workflows and release signer |
 | Deployed Edge | TypeScript (`apps/edge`); Rust/Wasm (`apps/edge-rust`) is built/tested and not deployed |

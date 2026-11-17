@@ -41,6 +41,7 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     setupFiles: ["./test/apply-migrations.ts"],
-    maxWorkers: 2,
+    // Serialize Workerd suites on GitHub runners to avoid contention in timing-sensitive tests.
+    maxWorkers: process.env.GITHUB_ACTIONS === "true" ? 1 : 2,
   },
 });

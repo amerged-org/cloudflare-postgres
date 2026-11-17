@@ -66,6 +66,25 @@ written, the answer stands and the event keeps `status: null`, which says the ou
 (also after a Worker that stopped mid-request), never that it succeeded. A refused key is
 refused whatever the log says. Look for `null` statuses after an incident.
 
+**SQL credential disclosures.** Either administrator scope can query
+`GET /v1/credential-disclosures?key_id=<key-id>` using `limit` and `cursor`.
+Each event records the date, key, project, database, role name, role creation time and password
+revision that the server authorized for release. Compare the role creation time when a deleted
+role name has been reused. The server writes the event before it returns a password-bearing
+connection URI. A D1 failure after bounded retries returns `500` without releasing the URI.
+Events are visible for 90 days and contain no passwords, URIs or request headers.
+
+If an integrator key is compromised, revoke the API key with `DELETE /v1/api-keys/{id}` and
+review its credential disclosures. Rotate any current or possibly exposed SQL passwords using
+`POST /v1/databases/{id}/roles/{name}/reset-password` with an `Idempotency-Key` through an
+authorized administrator or replacement integrator. Update the affected SQL clients through
+your credential store and verify they reconnect. A restore to a new database can inherit the
+source role's password. Rotate the source and any surviving restored copies that inherited the
+exposed password. The API key and SQL passwords have separate lifetimes.
+For any period before disclosure auditing was active, review all roles accessible to
+the compromised key as potentially exposed. A Worker rollback before the auditing release
+reopens that coverage gap, so record the interval and retain the additive D1 table.
+
 ## Lapsed administrator keys
 
 An administrator key made by an administrator expires after at most 366 days, and nothing warns

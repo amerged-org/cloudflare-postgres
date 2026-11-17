@@ -11,7 +11,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
-import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
+import { getAuth } from "../middleware/auth.ts";
 import {
   databaseHealthOf,
   latestAgentSampleSql,
@@ -231,14 +231,17 @@ export async function databaseForRequest(
   id: string,
   includeDeleted = false,
 ): Promise<DatabaseRow> {
-  await getAuth(c);
+  const auth = await getAuth(c);
+  const scoped = auth.scope === "integrator";
   const row = await c.env.DB.prepare(
-    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")},${coldSnapshotStorageSql("d")} cold_snapshot_storage_json FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}`,
+    `SELECT d.*,${latestAgentSampleSql("d")} agent_sample,${latestFilesystemSampleSql("d")} filesystem_sample,${effectiveSleepAfterSql("d")} effective_sleep_after_seconds,${effectiveResourcesColumnsSql("d")},${coldSnapshotStorageSql("d")} cold_snapshot_storage_json
+      FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
+      WHERE d.id=? ${includeDeleted ? "" : "AND d.deleted_at IS NULL"}
+      ${scoped ? "AND d.project_id=?" : ""}`,
   )
-    .bind(id)
+    .bind(...(scoped ? [id, auth.project_id] : [id]))
     .first<DatabaseRow>();
   if (!row) throw new ApiError("not_found", "Database not found");
-  await assertProjectAccess(c, row.project_id);
   return row;
 }
 /** Every operation an integrator can read: the table of the lifecycle and that of role removals. */
@@ -251,15 +254,17 @@ export async function operationForRequest(
   c: ApiContext,
   id: string,
 ): Promise<OperationRow> {
-  await getAuth(c);
+  const auth = await getAuth(c);
+  const scoped = auth.scope === "integrator";
   const row = await c.env.DB.prepare(
     `SELECT o.* FROM ${OPERATIONS_OF_ALL_KINDS} o
-      JOIN projects p ON p.id=o.project_id AND p.deleted_at IS NULL JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id WHERE o.id=?`,
+      JOIN projects p ON p.id=o.project_id AND p.deleted_at IS NULL
+      JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id
+      WHERE o.id=? ${scoped ? "AND o.project_id=?" : ""}`,
   )
-    .bind(id)
+    .bind(...(scoped ? [id, auth.project_id] : [id]))
     .first<OperationRow>();
   if (!row) throw new ApiError("not_found", "Operation not found");
-  await assertProjectAccess(c, row.project_id);
   return row;
 }
 /** One page of the operations of a database, newest first, with the extra row that marks a next page. */

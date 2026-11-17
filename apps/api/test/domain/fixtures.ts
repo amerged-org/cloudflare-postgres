@@ -75,6 +75,9 @@ export async function cleanupFixtures(): Promise<void> {
       "database_id IN(SELECT id FROM databases WHERE project_id IN(?,?))";
     await env.DB.batch([
       env.DB.prepare(
+        "DELETE FROM credential_disclosures WHERE project_id IN(?,?)",
+      ).bind(project, other),
+      env.DB.prepare(
         "DELETE FROM node_provider_mutations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
       ).bind(region, foreign),
       env.DB.prepare("DELETE FROM node_additions WHERE region_id IN(?,?)").bind(

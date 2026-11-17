@@ -4,11 +4,13 @@
 // alarm. D1 and the Durable Objects are real; only the receiver is replaced, by a spy on fetch.
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { ApiKeyCreated } from "@pgcf/contracts";
 import {
   WebhookCreated,
   WebhookDelivery,
   WebhookEnvelope,
   WebhookTestResult,
+  newWebhookId,
 } from "@pgcf/contracts/webhooks";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { runWebhookEvents } from "../../src/domain/webhook-events.ts";
@@ -134,9 +136,39 @@ it("replays an idempotent creation with the same webhook and secret", async () =
 it("keeps webhooks inside their project and asks an administrator for the project", async () => {
   const f = await fixture();
   const webhook = await created(await subscribe(f));
-  expect((await request(`/v1/webhooks/${webhook.id}`, f.otherKey)).status).toBe(
-    404,
+  const reader = ApiKeyCreated.parse(
+    await (
+      await request("/v1/api-keys", f.admin, "POST", {
+        name: "webhook-reader",
+        scope: "admin_read",
+      })
+    ).json(),
   );
+  const path = `/v1/webhooks/${webhook.id}`;
+  const headers = { "X-Request-Id": crypto.randomUUID() };
+  const foreignRead = await request(
+    path,
+    f.otherKey,
+    "GET",
+    undefined,
+    undefined,
+    headers,
+  );
+  const missingRead = await request(
+    `/v1/webhooks/${newWebhookId()}`,
+    f.otherKey,
+    "GET",
+    undefined,
+    undefined,
+    headers,
+  );
+  expect(foreignRead.status).toBe(404);
+  expect(missingRead.status).toBe(404);
+  expect(await foreignRead.json()).toEqual(await missingRead.json());
+  expect((await request(path, f.integrator)).status).toBe(200);
+  expect((await request(path, f.admin)).status).toBe(200);
+  expect((await request(path, reader.key)).status).toBe(200);
+  expect((await request(path, "")).status).toBe(401);
   expect(
     (await request(`/v1/webhooks/${webhook.id}`, f.otherKey, "DELETE")).status,
   ).toBe(404);

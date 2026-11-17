@@ -3,7 +3,7 @@
 [node-image/](node-image/README.md) builds the Debian disk image that every node installs from: the
 pinned package lock, the systemd units, the installer and the QEMU boot test that CI runs.
 
-The node stack is **Debian 13 (trixie), systemd, PostgreSQL 18.6 and thin LVM**. Its four
+The node image pins **Debian 13 (trixie), systemd, PostgreSQL 18.7 and thin LVM**. Its four
 first-party binaries are native Rust: `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive` and
 `pgcf-wal-fetch`. The slot supervisor executes PostgreSQL after binding a database's retained
 volume and socket. The image requires no Node.js runtime; the Cloudflare API, Durable Objects,

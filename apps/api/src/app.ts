@@ -77,6 +77,7 @@ export const DIAGNOSTIC_ROUTES = new Set([
   "/v1/api-keys",
   "/v1/api-keys/:id",
   "/v1/audit-events",
+  "/v1/credential-disclosures",
   "/v1/projects",
   "/v1/projects/:id",
   "/v1/size-classes",

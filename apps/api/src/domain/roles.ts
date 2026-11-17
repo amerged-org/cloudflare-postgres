@@ -15,6 +15,7 @@ import type { ApiContext, AuthPrincipal } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
+import { recordCredentialDisclosure } from "./credential-disclosures.ts";
 import {
   publishForAnswer,
   settleWithin,
@@ -500,16 +501,30 @@ export async function connectionUri(
     host.includes("..")
   )
     throw new ApiError("internal", "Database endpoint is not configured");
-  const password = await passwordForCaller(c.env, auth, id, name, role);
+  const password =
+    c.req.method === "HEAD"
+      ? null
+      : await passwordForCaller(c.env, auth, id, name, role);
   const uri = `postgres://${encodeURIComponent(name)}${password === null ? "" : `:${encodeURIComponent(password)}`}@${host}/${id}`;
-  return c.json(
-    ConnectionUri.parse({
-      database_id: id,
-      role: name,
-      host,
-      database: id,
-      uri,
-      includes_password: password !== null,
-    }),
-  );
+  const response = ConnectionUri.parse({
+    database_id: id,
+    role: name,
+    host,
+    database: id,
+    uri,
+    includes_password: password !== null,
+  });
+  if (password !== null) {
+    if (auth.project_id === null)
+      throw new ApiError("internal", "Project authorization is unavailable");
+    await recordCredentialDisclosure(c, {
+      key_id: auth.id,
+      project_id: auth.project_id,
+      database_id: role.database_id,
+      role: role.name,
+      role_created_at: role.created_at,
+      password_revision: role.password_revision,
+    });
+  }
+  return c.json(response);
 }

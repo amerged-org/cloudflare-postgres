@@ -359,10 +359,9 @@ impl Watch {
         if watch < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(AsyncFd::with_interest(
-            fd,
-            tokio::io::Interest::READABLE,
-        )?))
+        // SAFETY: the watch owns the inotify descriptor and only borrows it for reads.
+        let fd = unsafe { AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }?;
+        Ok(Self(fd))
     }
 
     /// Waits until something was written, and reads what is queued.
@@ -582,10 +581,11 @@ impl<R: CommandRunner + Send + Sync + 'static> Host for System<R> {
     }
 
     async fn ready(&self, slot: u32, database: &str, main_pid: u32) -> Result<PathBuf, Error> {
-        let pidfd = AsyncFd::with_interest(
-            self.pidfd(slot, main_pid)?.try_clone()?,
-            tokio::io::Interest::READABLE,
-        )?;
+        let pidfd = self.pidfd(slot, main_pid)?.try_clone()?;
+        // SAFETY: the registration owns this duplicate and the wait loop only borrows it.
+        let pidfd =
+            unsafe { AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE) }
+                .map_err(io::Error::from)?;
         // The watch is armed before the first look, so that a write in between is queued.
         let watch = Watch::new(&self.layout.data(database))?;
         let directory = self.layout.volume(database);
@@ -870,11 +870,10 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let fd = AsyncFd::with_interest(
-            pidfd_open(child.id()).unwrap(),
-            tokio::io::Interest::READABLE,
-        )
-        .unwrap();
+        let fd = pidfd_open(child.id()).unwrap();
+        // SAFETY: the registration owns the pidfd and both waits only borrow it.
+        let fd =
+            unsafe { AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }.unwrap();
         let waiting = tokio::time::timeout(Duration::from_millis(100), fd.readable()).await;
         assert!(waiting.is_err(), "the process lives");
         child.kill().unwrap();
