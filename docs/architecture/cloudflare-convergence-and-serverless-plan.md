@@ -51,6 +51,14 @@ uses the regular database owner, verifies opt-in and repeated activation, return
 match through the GIN index and confirms another database remains unconfigured. EU1 acceptance
 still requires the security update and an extension query on the restored target.
 
+**EU1 acceptance runners prepared.** The extension runner checks six opt-in modules on one
+explicitly selected EU1 node, including GIN search and constraint behavior before and after a
+physical restore. The RLS runner checks the local compatibility report and uses separate
+restricted PostgreSQL logins for the source and converted policies. The same RLS witness
+confirmed three retained or translated policies and eight equal access decisions on disposable
+local PostgreSQL databases. Both runners require a patched engine on EU1 and confirm cleanup of
+their disposable databases.
+
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)

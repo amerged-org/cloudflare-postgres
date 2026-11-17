@@ -692,6 +692,26 @@ SELECT id, name FROM public.products WHERE name OPERATOR(extensions.%) 'Schmit';
 Activation affects only the selected database. An application role querying explicitly qualified
 extension objects needs `USAGE` on the installation schema and its usual table permissions.
 
+#### EU1 extension and import acceptance
+
+Use an operator-owned project and the existing EU1 node. Set `PGCF_API_URL`,
+`PGCF_INTEGRATOR_API_KEY`, `PGCF_PROJECT_ID`, `PGCF_REGION_ID`, `PGCF_EU1_NODE_ID`,
+`PGCF_SIZE_CLASS_ID` and a unique `PGCF_EXTENSION_RUN_ID` in the process environment. Use
+the management API's exact region ID, such as `eu-dev`, and verify the assigned node.
+
+```sh
+pnpm --filter @pgcf/e2e exec node src/extension-acceptance.ts run
+pnpm --filter @pgcf/e2e exec node src/rls-import-acceptance.ts run
+```
+
+The extension run verifies activation, queries, constraints, index use and a physical restore for
+`pg_trgm`, `unaccent`, `btree_gist`, `citext`, `pgcrypto` and `ltree`. The RLS run also
+requires `PGCF_RLS_BASELINE_SCRIPT`, the absolute path to the reviewed adopter converter. It runs
+the report-only check and compares the original and converted access decisions through distinct
+restricted database logins. Both runs require patched PostgreSQL 18 on the specified node and
+clean up their disposable databases. Verify separately that the adopter authenticates sessions
+before supplying the claims and that its hosted route uses the scoped runtime role.
+
 ### 2.2 Operations and readiness
 
 `GET /v1/operations/{id}` returns `{id, kind, status, database_id, generation, error, ...}`.
