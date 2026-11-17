@@ -32,6 +32,11 @@ from one row, and equal absent-resource responses for project-scoped lookups. Th
 suite passed 1,481 tests across 150 files, and the Worker bundle built in a deployment dry-run.
 Hosted CI exposed a race in an existing wake-claim test. The test now waits for the asynchronous
 node hint after checking the SQL ordering. All five tests in that file passed locally.
+The hosted image, kernel and Rust jobs passed with the refreshed binaries. In the same run,
+two unrelated API tests exceeded their fixture timeouts and a role publication assertion
+observed 3,160 ms against its 3,000 ms bound. The GitHub API job now runs its Workerd test files
+serially with the same assertions and deadlines. All 53 tests of the affected files passed
+in that runner mode locally.
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)
