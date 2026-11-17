@@ -364,6 +364,22 @@ describe("actual generated API references in the Workers runtime", () => {
       "503",
     ]);
     expect(audit.description).toContain("admin_read");
+    const disclosures = operation(doc, "/v1/credential-disclosures", "get");
+    expect(disclosures.operationId).toBe("listCredentialDisclosures");
+    expect(disclosures.parameters?.map((parameter) => parameter.name)).toEqual(
+      expect.arrayContaining(["cursor", "limit", "key_id"]),
+    );
+    expect(disclosures.security).toEqual([{ bearerAuth: [] }]);
+    expect(Object.keys(schemas.CredentialDisclosure!.properties!)).toEqual([
+      "id",
+      "key_id",
+      "project_id",
+      "database_id",
+      "role",
+      "role_created_at",
+      "password_revision",
+      "created_at",
+    ]);
     // A read-only key reads what administrators read and is refused every change.
     expect(operation(doc, "/v1/nodes", "get").description).toContain(
       "admin_read",

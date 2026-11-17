@@ -6,6 +6,9 @@ import {
   AUDIT_RETENTION_DAYS,
   ApiKeyCreated,
   AuditEvent,
+  ConnectionUri,
+  CredentialDisclosure,
+  DatabaseWithOperation,
   ErrorBody,
   hashApiKey,
   listEnvelope,
@@ -17,6 +20,7 @@ import { cleanupFixtures, fixture, request } from "../domain/fixtures.ts";
 
 const DAY = 86_400_000;
 const AuditPage = listEnvelope(AuditEvent);
+const DisclosurePage = listEnvelope(CredentialDisclosure);
 type F = Awaited<ReturnType<typeof fixture>>;
 
 /** A key made through the API, named so that the cleanup finds it. */
@@ -476,20 +480,25 @@ describe("the audit log", () => {
    * ("Network connection lost" after about 12 s, 2026-10-23 16:03:35): `plan` says, for the attempt
    * with that number, whether the insert fails before it reaches D1, after D1 committed it, or not.
    */
-  function faultyAudit(plan: (attempt: number) => "before" | "after" | "ok") {
+  function faultyAudit(
+    plan: (
+      attempt: number,
+    ) => "before" | "after" | "ok" | Promise<"before" | "after" | "ok">,
+    table: "audit_events" | "credential_disclosures" = "audit_events",
+  ) {
     let attempts = 0;
     const db = new Proxy(env.DB, {
       get(target, key) {
         if (key === "prepare")
           return (sql: string) => {
             const statement = target.prepare(sql);
-            if (!sql.startsWith("INSERT INTO audit_events")) return statement;
+            if (!sql.startsWith(`INSERT INTO ${table}`)) return statement;
             return {
               bind: (...values: unknown[]) => {
                 const bound = statement.bind(...values);
                 return {
                   run: async () => {
-                    const mode = plan(++attempts);
+                    const mode = await plan(++attempts);
                     if (mode === "before")
                       throw new Error("D1_ERROR: Network connection lost.");
                     const result = await bound.run();
@@ -507,6 +516,249 @@ describe("the audit log", () => {
     });
     return { bindings: { DB: db }, attempts: () => attempts };
   }
+
+  it("records each credential release once across lost acknowledgements and shared request IDs", async () => {
+    const f = await fixture();
+    const { database } = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    const path = `/v1/databases/${database.id}/roles/app/connection-uri`;
+    const keyId = await keyIdOf(f.integrator);
+    const headers = { "X-Request-Id": "shared-credential-read" };
+    const fault = faultyAudit(
+      (attempt) => (attempt === 1 ? "after" : "ok"),
+      "credential_disclosures",
+    );
+    const first = await request(
+      path,
+      f.integrator,
+      "GET",
+      undefined,
+      undefined,
+      headers,
+      fault.bindings,
+    );
+    expect(first.status).toBe(200);
+    expect(fault.attempts()).toBe(2);
+    const second = await request(
+      path,
+      f.integrator,
+      "GET",
+      undefined,
+      undefined,
+      headers,
+    );
+    expect(second.status).toBe(200);
+    const disclosure = await request(
+      `/v1/credential-disclosures?key_id=${keyId}`,
+      f.admin,
+    );
+    expect(disclosure.status).toBe(200);
+    const { data } = DisclosurePage.parse(await disclosure.json());
+    expect(data).toHaveLength(2);
+    expect(new Set(data.map((event) => event.id)).size).toBe(2);
+    expect(data.map((event) => event.password_revision)).toEqual([1, 1]);
+  });
+
+  it("withholds the SQL password when its disclosure cannot be recorded", async () => {
+    const f = await fixture();
+    const { database } = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    const path = `/v1/databases/${database.id}/roles/app/connection-uri`;
+    const fault = faultyAudit(() => "before", "credential_disclosures");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const response = await request(
+        path,
+        f.integrator,
+        "GET",
+        undefined,
+        undefined,
+        undefined,
+        fault.bindings,
+      );
+      expect(response.status).toBe(500);
+      expect(fault.attempts()).toBe(3);
+      const error = ErrorBody.parse(await response.json());
+      expect(error.error).toMatchObject({
+        code: "internal",
+        message: "The credential disclosure could not be recorded",
+      });
+      const auditLogs = logged.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((line) => line.phase === "credential_disclosure");
+      expect(auditLogs).toHaveLength(3);
+      expect(auditLogs.every((line) => line.message === undefined)).toBe(true);
+      expect(auditLogs[2]).toMatchObject({
+        event: "audit_write_failed",
+        error_code: "d1_error",
+        attempts: 3,
+      });
+    } finally {
+      logged.mockRestore();
+    }
+    expect(await count("credential_disclosures")).toBe(0);
+  });
+
+  it("records the returned password revision when the role rotates before the audit insert", async () => {
+    const f = await fixture();
+    const { database } = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    const path = `/v1/databases/${database.id}/roles/app`;
+    const rotation = faultyAudit(async (attempt): Promise<"ok"> => {
+      if (attempt === 1) {
+        const reset = await request(
+          `${path}/reset-password`,
+          f.integrator,
+          "POST",
+          undefined,
+          crypto.randomUUID(),
+        );
+        expect(reset.status).toBe(200);
+      }
+      return "ok";
+    }, "credential_disclosures");
+    const previous = await request(
+      `${path}/connection-uri`,
+      f.integrator,
+      "GET",
+      undefined,
+      undefined,
+      undefined,
+      rotation.bindings,
+    );
+    const current = await request(`${path}/connection-uri`, f.integrator);
+    expect(previous.status).toBe(200);
+    expect(current.status).toBe(200);
+    const oldUri = ConnectionUri.parse(await previous.json()).uri;
+    const newUri = ConnectionUri.parse(await current.json()).uri;
+    expect(oldUri !== newUri).toBe(true);
+    const rows = await env.DB.prepare(
+      "SELECT password_revision FROM credential_disclosures WHERE database_id=? ORDER BY rowid",
+    )
+      .bind(database.id)
+      .all<{ password_revision: number }>();
+    expect(rows.results.map((row) => row.password_revision)).toEqual([1, 2]);
+  });
+
+  it("skips decryption and disclosure records for HEAD and non-password responses", async () => {
+    const f = await fixture();
+    const { database } = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    const path = `/v1/databases/${database.id}/roles/app/connection-uri`;
+    const invalidKeyring = { CREDENTIAL_KEYS: "invalid" };
+    const head = await request(
+      path,
+      f.integrator,
+      "HEAD",
+      undefined,
+      undefined,
+      undefined,
+      invalidKeyring,
+    );
+    const admin = await request(
+      path,
+      f.admin,
+      "GET",
+      undefined,
+      undefined,
+      undefined,
+      invalidKeyring,
+    );
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe("");
+    expect(head.headers.get("Content-Type")).toBe(
+      admin.headers.get("Content-Type"),
+    );
+    expect(admin.status).toBe(200);
+    expect(ConnectionUri.parse(await admin.json()).includes_password).toBe(
+      false,
+    );
+    expect((await request(path, f.otherKey)).status).toBe(404);
+    expect(await count("credential_disclosures")).toBe(0);
+  });
+
+  it("lists only current credential disclosures with operator access and a filter across pages", async () => {
+    const f = await fixture();
+    const reader = await mint(f.admin, { scope: "admin_read" });
+    const { database } = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    const keyId = (await keyIdOf(f.integrator))!;
+    const otherId = (await keyIdOf(f.otherKey))!;
+    const now = Date.now();
+    const events = [
+      { key: keyId, revision: 2, time: now - DAY },
+      { key: otherId, revision: 3, time: now - 2 * DAY },
+      { key: keyId, revision: 1, time: now - 3 * DAY },
+      { key: keyId, revision: 4, time: now - (AUDIT_RETENTION_DAYS + 1) * DAY },
+    ];
+    await env.DB.batch(
+      events.map(({ key, revision, time }) =>
+        env.DB.prepare(
+          `INSERT INTO credential_disclosures
+          (id,key_id,project_id,database_id,role,role_created_at,password_revision,created_at)
+         VALUES(?,?,?,?,'app',?,?,?)`,
+        ).bind(
+          crypto.randomUUID(),
+          key,
+          f.project,
+          database.id,
+          new Date(now - (AUDIT_RETENTION_DAYS + 2) * DAY).toISOString(),
+          revision,
+          new Date(time).toISOString(),
+        ),
+      ),
+    );
+    const path = "/v1/credential-disclosures";
+    expect((await request(path, f.integrator)).status).toBe(403);
+    expect((await request(`${path}?key_id=invalid`, f.admin)).status).toBe(400);
+    const scope = `${path}?limit=1&key_id=${keyId}`;
+    const first = await request(scope, reader.key);
+    expect(first.status).toBe(200);
+    const firstPage = DisclosurePage.parse(await first.json());
+    expect(firstPage.data.map((event) => event.password_revision)).toEqual([2]);
+    expect(firstPage.next_cursor).not.toBeNull();
+    const second = await request(
+      `${scope}&cursor=${firstPage.next_cursor}`,
+      f.admin,
+    );
+    expect(second.status).toBe(200);
+    const secondPage = DisclosurePage.parse(await second.json());
+    expect(secondPage.data.map((event) => event.password_revision)).toEqual([
+      1,
+    ]);
+    expect(secondPage.next_cursor).toBeNull();
+    expect(await count("credential_disclosures")).toBe(4);
+    expect(
+      (
+        await request(
+          `/v1/databases/${database.id}/roles/app/connection-uri`,
+          f.integrator,
+        )
+      ).status,
+    ).toBe(200);
+    expect(await count("credential_disclosures")).toBe(4);
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM credential_disclosures WHERE created_at < ?",
+      )
+        .bind(new Date(now - AUDIT_RETENTION_DAYS * DAY).toISOString())
+        .first("count"),
+    ).toBe(0);
+    expect(
+      (await request(`/v1/api-keys/${keyId}`, f.admin, "DELETE")).status,
+    ).toBe(204);
+    const revoked = DisclosurePage.parse(
+      await (await request(`${path}?key_id=${keyId}`, reader.key)).json(),
+    );
+    expect(revoked.data.map((event) => event.password_revision)).toEqual([
+      1, 2, 1,
+    ]);
+  });
 
   it("writes its audit row again after a transient D1 fault, and the change runs once", async () => {
     const f = await fixture();

@@ -30,7 +30,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.7.0";
+export const API_CONTRACT_VERSION = "1.8.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -912,6 +912,30 @@ export const AuditEvent = z
       "One request of an administrator key. A request of an admin or admin_read key with any method but GET or HEAD is recorded before it runs; the refusal of a revoked or an expired administrator key that was presented with its real secret is recorded with status 401 (a wrong secret is not: the identifier in a key string is not secret). Reads that succeed are not recorded. No body, query, path parameter, key material or address is kept.",
   });
 export type AuditEvent = z.infer<typeof AuditEvent>;
+
+export const CredentialDisclosure = z
+  .strictObject({
+    id: z.uuid(),
+    key_id: ApiKeyId,
+    project_id: ProjectId,
+    database_id: DatabaseId,
+    role: RoleName,
+    role_created_at: Timestamp.describe(
+      "The creation time of this role incarnation.",
+    ),
+    password_revision: z.number().int().positive(),
+    created_at: Timestamp,
+  })
+  .meta({
+    id: "CredentialDisclosure",
+    description:
+      "Server authorization to release a SQL role password revision.",
+  });
+export type CredentialDisclosure = z.infer<typeof CredentialDisclosure>;
+
+export const CredentialDisclosureListQuery = ListQuery.extend({
+  key_id: ApiKeyId.optional(),
+});
 
 /** The full key appears only in this creation response. */
 export const ApiKeyCreated = z

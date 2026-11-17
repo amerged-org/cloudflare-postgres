@@ -14,6 +14,7 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/api-keys": [400, 401, 403, 500],
   "DELETE /v1/api-keys/{id}": [400, 401, 403, 404, 409, 500],
   "GET /v1/audit-events": [400, 401, 403, 500],
+  "GET /v1/credential-disclosures": [400, 401, 403, 500],
   "POST /v1/projects": [400, 401, 403, 404, 409, 500],
   "GET /v1/projects": [400, 401, 500],
   "GET /v1/projects/{id}": [400, 401, 404, 500],
