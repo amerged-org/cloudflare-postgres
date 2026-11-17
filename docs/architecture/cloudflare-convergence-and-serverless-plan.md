@@ -3,7 +3,14 @@
 The [application feature design and task plans](2026-11-17-postgres-application-features.md)
 cover opt-in PostgreSQL extensions, preservation of application access rules during a
 Supabase import and authorized browser notifications for committed changes. Each track
-has an independent release gate. Implementation and live acceptance are open.
+has an independent release gate.
+
+**Trigram search, local qualification.** Digest-verified Debian packages for the deployed
+PostgreSQL 18.6 and the proposed 18.7 security update both supply trusted `pg_trgm` 1.6.
+The local PostgreSQL 18.6 role suite executed 11 tests without failure or skips. The new test
+uses the regular database owner, verifies opt-in and repeated activation, returns the expected
+match through the GIN index and confirms another database remains unconfigured. EU1 acceptance
+still requires the security update and an extension query on the restored target.
 
 # Security hardening release — 2026-11-15
 

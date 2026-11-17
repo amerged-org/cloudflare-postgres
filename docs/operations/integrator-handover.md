@@ -669,6 +669,29 @@ is DONE, so it is never writable before it is restorable. The idle time
 - Engine: PostgreSQL 18 (18.6 at the time of writing, unmodified engine, `pgvector` 0.8.7). Which
   other extensions the owner role may create is **not yet verified**.
 
+#### Opt-in trigram search
+
+The pinned PostgreSQL packages contain the trusted `pg_trgm` extension, version 1.6.
+The node agent's real-PostgreSQL test checks that the database owner can install it in a schema
+the owner controls and use a GIN index for similarity search. This is local role and engine
+coverage. EU1 activation and physical restore acceptance are open.
+
+Run the following as the database owner or as a migration role with `CREATE` on the selected
+database. The example assumes the migration role owns `public.products(id, name text)`. If
+the extension already exists, check its version and schema in `pg_extension` and `pg_namespace`.
+Use its installed schema to qualify the operator and index class. PostgreSQL's `IF NOT EXISTS`
+retains the existing installation. Verify the schema owner and its grants before reusing it.
+
+```sql
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+CREATE INDEX products_name_trgm ON public.products USING gin (name extensions.gin_trgm_ops);
+SELECT id, name FROM public.products WHERE name OPERATOR(extensions.%) 'Schmit';
+```
+
+Activation affects only the selected database. An application role querying explicitly qualified
+extension objects needs `USAGE` on the installation schema and its usual table permissions.
+
 ### 2.2 Operations and readiness
 
 `GET /v1/operations/{id}` returns `{id, kind, status, database_id, generation, error, ...}`.

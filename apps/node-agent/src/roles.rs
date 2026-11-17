@@ -711,6 +711,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extension_owner_activation_supports_indexed_trigram_search() {
+        let Some((cluster, agent)) = started().await else {
+            return;
+        };
+        let owner = wanted(json!([
+            {"name":"app","owner":true,"password":pw(),"revision":1}
+        ]));
+        apply(&agent, &owner, &BTreeMap::new(), false)
+            .await
+            .unwrap();
+        ensure_database(&agent, &cluster.id, "app").await.unwrap();
+
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host_path(cluster.socket_directory())
+            .port(crate::layout::PORT)
+            .user("app")
+            .password(pw())
+            .dbname(&cluster.id);
+        let (mut owner, connection) = config.connect(tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(connection);
+
+        let available = owner
+            .query_one(
+                "SELECT default_version, installed_version FROM pg_available_extensions WHERE name = 'pg_trgm'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let version: String = available.get(0);
+        assert_eq!(available.get::<_, Option<String>>(1), None);
+
+        owner
+            .batch_execute(
+                "CREATE SCHEMA extensions;
+                 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+                 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+                 CREATE TABLE products (id integer PRIMARY KEY, name text NOT NULL);
+                 INSERT INTO products VALUES (1, 'Schmidt'), (2, 'Zimmermann');
+                 CREATE INDEX product_name_trgm ON products USING gin (name extensions.gin_trgm_ops)",
+            )
+            .await
+            .unwrap();
+        let installed = owner
+            .query_one(
+                "SELECT e.extversion, n.nspname::text FROM pg_extension e
+                 JOIN pg_namespace n ON n.oid = e.extnamespace WHERE e.extname = 'pg_trgm'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed.get::<_, String>(0), version);
+        assert_eq!(installed.get::<_, String>(1), "extensions");
+
+        let transaction = owner.transaction().await.unwrap();
+        // Prefer an indexed plan even for two rows. This checks the index can serve the query.
+        transaction
+            .batch_execute("SET LOCAL enable_seqscan = off")
+            .await
+            .unwrap();
+        let search = "SELECT id FROM products WHERE name OPERATOR(extensions.%) $1";
+        let plan = transaction
+            .query(&format!("EXPLAIN (COSTS OFF) {search}"), &[&"Schmit"])
+            .await
+            .unwrap();
+        assert!(plan.iter().any(|row| {
+            row.get::<_, String>(0)
+                .contains("Bitmap Index Scan on product_name_trgm")
+        }));
+        assert_eq!(
+            transaction
+                .query_one(search, &[&"Schmit"])
+                .await
+                .unwrap()
+                .get::<_, i32>(0),
+            1
+        );
+        transaction.commit().await.unwrap();
+
+        assert!(
+            agent
+                .query("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'", &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn restrictive_memberships_replace_every_grantor_and_preserve_role_settings() {
         let Some((cluster, agent)) = started().await else {
             return;
