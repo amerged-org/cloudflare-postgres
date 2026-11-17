@@ -1,3 +1,10 @@
+# Application features proposed — 2026-11-17
+
+The [application feature design and task plans](2026-11-17-postgres-application-features.md)
+cover opt-in PostgreSQL extensions, preservation of application access rules during a
+Supabase import and authorized browser notifications for committed changes. Each track
+has an independent release gate. Implementation and live acceptance are open.
+
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)
