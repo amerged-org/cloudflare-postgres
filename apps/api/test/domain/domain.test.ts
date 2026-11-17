@@ -284,16 +284,43 @@ describe("database domain on real Workers D1", () => {
   it("scopes every domain resource to its project", async () => {
     const f = await fixture(),
       body = await created(f),
-      id = body.database.id;
-    const paths = [
-      `/v1/databases/${id}`,
-      `/v1/databases/${id}/roles`,
-      `/v1/databases/${id}/roles/app/connection-uri`,
-      `/v1/databases/${id}/archive`,
+      id = body.database.id,
+      absentId = newDatabaseId();
+    const reader = ApiKeyCreated.parse(
+      await (
+        await request("/v1/api-keys", f.admin, "POST", {
+          name: "domain-reader",
+          scope: "admin_read",
+        })
+      ).json(),
+    );
+    const paths: [string, string][] = [
+      "",
+      "/roles",
+      "/roles/app/connection-uri",
+      "/archive",
+    ].map((suffix) => [
+      `/v1/databases/${id}${suffix}`,
+      `/v1/databases/${absentId}${suffix}`,
+    ]);
+    paths.push([
       `/v1/operations/${body.operation.id}`,
-    ];
-    for (const path of paths)
-      expect((await request(path, f.otherKey)).status).toBe(404);
+      `/v1/operations/${newOperationId()}`,
+    ]);
+    const headers = { "X-Request-Id": crypto.randomUUID() };
+    const foreignRead = (path: string) =>
+      request(path, f.otherKey, "GET", undefined, undefined, headers);
+    for (const [path, absent] of paths) {
+      const foreign = await foreignRead(path);
+      const missing = await foreignRead(absent);
+      expect(foreign.status).toBe(404);
+      expect(missing.status).toBe(404);
+      expect(await foreign.json()).toEqual(await missing.json());
+      expect((await request(path, f.integrator)).status).toBe(200);
+      expect((await request(path, f.admin)).status).toBe(200);
+      expect((await request(path, reader.key)).status).toBe(200);
+      expect((await request(path, "")).status).toBe(401);
+    }
     expect(
       (await request(`/v1/databases/${id}`, f.otherKey, "DELETE")).status,
     ).toBe(404);

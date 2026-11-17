@@ -80,14 +80,15 @@ async function webhookForRequest(
   c: ApiContext,
   id: string,
 ): Promise<WebhookRow> {
-  await getAuth(c);
+  const auth = await getAuth(c);
+  const scoped = auth.scope === "integrator";
   const row = await c.env.DB.prepare(
-    `SELECT ${WEBHOOK_COLUMNS} FROM webhook_subscriptions WHERE id = ? AND deleted_at IS NULL`,
+    `SELECT ${WEBHOOK_COLUMNS} FROM webhook_subscriptions
+      WHERE id = ? AND deleted_at IS NULL ${scoped ? "AND project_id = ?" : ""}`,
   )
-    .bind(id)
+    .bind(...(scoped ? [id, auth.project_id] : [id]))
     .first<WebhookRow>();
   if (!row) throw new ApiError("not_found", "Webhook not found");
-  await assertProjectAccess(c, row.project_id);
   return row;
 }
 
