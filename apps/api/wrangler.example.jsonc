@@ -49,6 +49,8 @@
     // NATIVE_EXTENDED_RESOURCES_RELEASE_IDS: a JSON array of signed release IDs qualified for MiB
     // storage and restrictive role memberships. Unset/invalid means none; enable only after native
     // rollout and OS/readback verification. Keep compatible current and next release IDs during updates.
+    // NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS: signed releases qualified with both managed
+    // extension packages and the native install protocol. Unset or invalid allows no opt-in.
     // COLD_STORAGE_ARCHIVAL_ENABLED: "true" enables new 21-day archive claims after Dev acceptance.
     // Unset/false stops new archival; restoration of existing archives remains operational.
     // COLD_STORAGE_ARCHIVAL_DATABASE_IDS: optional JSON array of at most 256 database IDs for

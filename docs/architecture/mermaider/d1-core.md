@@ -165,5 +165,6 @@ erDiagram
 - [apps/api/migrations/0099_archive_backup_digests.sql:1](../../../apps/api/migrations/0099_archive_backup_digests.sql#L1)
 - [apps/api/migrations/0100_archive_digest_backfill.sql:1](../../../apps/api/migrations/0100_archive_digest_backfill.sql#L1)
 - [apps/api/migrations/0101_credential_disclosures.sql:1](../../../apps/api/migrations/0101_credential_disclosures.sql#L1)
+- [apps/api/migrations/0102_managed_extensions.sql:1](../../../apps/api/migrations/0102_managed_extensions.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

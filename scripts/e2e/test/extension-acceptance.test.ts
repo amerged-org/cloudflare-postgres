@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateExtensionObservation } from "../src/extension-acceptance.ts";
+import {
+  validateExtensionObservation,
+  validateManagedExtensionObservation,
+} from "../src/extension-acceptance.ts";
 
 const extensions = [
   ["btree_gist", "1.8", "extensions"],
@@ -60,5 +63,75 @@ test("accepts a patched restricted database owner, all fixture results and the G
   assert.throws(
     () => validateExtensionObservation(noIndex),
     /trigram_index_plan/,
+  );
+});
+
+function managedObservation() {
+  return {
+    results: [
+      { rows: [["180007", "t"]] },
+      {
+        rows: [
+          [
+            "pg_jsonschema",
+            "0.3.4",
+            "pgcf_extensions",
+            "postgres",
+            "postgres",
+            "t",
+            "f",
+          ],
+          [
+            "postgis",
+            "3.7.0",
+            "pgcf_extensions",
+            "postgres",
+            "postgres",
+            "t",
+            "f",
+          ],
+        ],
+      },
+      { rows: [["1", "3", "f"]] },
+      { rows: [] },
+      { rows: [["Index Scan using managed_store_radius on managed_stores"]] },
+    ],
+  };
+}
+
+test("managed evidence requires agent-owned catalog entries, an indexed radius match and JSON type rejection", () => {
+  assert.deepEqual(validateManagedExtensionObservation(managedObservation()), {
+    serverVersion: 180007,
+    versions: ["0.3.4", "3.7.0"],
+  });
+  const wrongOwner = managedObservation();
+  wrongOwner.results[1]!.rows[0]![3] = "app";
+  assert.throws(
+    () => validateManagedExtensionObservation(wrongOwner),
+    /managed_extension_catalog/,
+  );
+  const writableSchema = managedObservation();
+  writableSchema.results[1]!.rows[0]![6] = "t";
+  assert.throws(
+    () => validateManagedExtensionObservation(writableSchema),
+    /managed_extension_catalog/,
+  );
+  const wrongVersion = managedObservation();
+  wrongVersion.results[1]!.rows[1]![1] = "3.6.1";
+  assert.throws(
+    () => validateManagedExtensionObservation(wrongVersion),
+    /managed_extension_catalog/,
+  );
+  const acceptsWrongType = managedObservation();
+  acceptsWrongType.results[2]!.rows[0]![2] = "t";
+  assert.throws(
+    () => validateManagedExtensionObservation(acceptsWrongType),
+    /managed_extension_results/,
+  );
+  const noIndex = managedObservation();
+  noIndex.results[4]!.rows = [["Seq Scan on managed_stores"]];
+  assert.throws(
+    () => validateManagedExtensionObservation(noIndex),
+    /postgis_radius_index_plan/,
   );
 });

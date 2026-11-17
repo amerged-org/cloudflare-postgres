@@ -5,6 +5,10 @@ import { ApiError } from "../api-error.ts";
 import type { Env } from "../env.ts";
 
 type CapabilityEnv = Pick<Env, "DB" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">;
+export type ManagedExtensionsEnv = Pick<
+  Env,
+  "DB" | "NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS"
+>;
 export interface NativeGuard {
   sql: string;
   bindings: (string | number | null)[];
@@ -172,4 +176,70 @@ export function coldStorageNativeGuard(
     now,
     delivery,
   );
+}
+
+function managedCapabilities(env: ManagedExtensionsEnv): CapabilityEnv {
+  return {
+    DB: env.DB,
+    NATIVE_EXTENDED_RESOURCES_RELEASE_IDS:
+      env.NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS,
+  };
+}
+
+/** A qualified image supplies both libraries and their matching native install protocol. */
+export function managedExtensionsNativeGuard(
+  env: ManagedExtensionsEnv,
+  scope: { regionId?: string; nodeId?: string },
+  required: boolean,
+  now = Date.now(),
+  delivery = false,
+): NativeGuard {
+  return extendedNativeGuard(
+    managedCapabilities(env),
+    scope,
+    required,
+    now,
+    delivery,
+  );
+}
+
+export async function requireManagedExtensionsNative(
+  env: ManagedExtensionsEnv,
+  scope: { regionId?: string; nodeId?: string },
+  required: boolean,
+  now = Date.now(),
+  delivery = false,
+): Promise<NativeGuard> {
+  const guard = managedExtensionsNativeGuard(
+    env,
+    scope,
+    required,
+    now,
+    delivery,
+  );
+  if (
+    required &&
+    !(await env.DB.prepare(`SELECT 1 WHERE ${guard.sql}`)
+      .bind(...guard.bindings)
+      .first())
+  )
+    throw new ApiError(
+      "conflict",
+      "Managed extensions require a qualified native release",
+      { reason: "not_ready" },
+    );
+  return guard;
+}
+
+export function managedExtensionsAssignmentGuard(
+  env: ManagedExtensionsEnv,
+  regionId: string,
+  releaseId: string,
+): NativeGuard {
+  if (extendedNativeReleaseIds(managedCapabilities(env)).includes(releaseId))
+    return unrestricted();
+  return {
+    sql: "EXISTS(SELECT 1 FROM regions WHERE id=? AND native_managed_extensions_required=0)",
+    bindings: [regionId],
+  };
 }

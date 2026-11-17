@@ -486,6 +486,84 @@ scratch_database_runs_across_an_agent_restart() {
 	}
 }
 
+# The image supplies both optional modules but the scratch cluster starts with neither installed.
+# Check the actual guest's library ABI and SQL behavior without retaining any fixture objects.
+optional_extension_libraries() {
+	/usr/lib/postgresql/18/bin/psql -Xq --no-password --set=ON_ERROR_STOP=1 \
+		--host=/run/pgcf/pgcfcheckscratch0000 --username=postgres --dbname=postgres <<'SQL'
+BEGIN;
+CREATE ROLE pgcf_extension_probe NOLOGIN;
+GRANT CREATE ON DATABASE postgres TO pgcf_extension_probe;
+SET LOCAL ROLE pgcf_extension_probe;
+CREATE SCHEMA pgcf_extension_probe;
+DO $$
+BEGIN
+  BEGIN
+    CREATE EXTENSION postgis WITH SCHEMA pgcf_extension_probe;
+    RAISE EXCEPTION 'PostGIS accepted a non-superuser install';
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+  END;
+  BEGIN
+    CREATE EXTENSION pg_jsonschema WITH SCHEMA pgcf_extension_probe;
+    RAISE EXCEPTION 'pg_jsonschema accepted a non-superuser install';
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+  END;
+END $$;
+RESET ROLE;
+CREATE SCHEMA pgcf_extensions AUTHORIZATION postgres;
+GRANT USAGE ON SCHEMA pgcf_extensions TO PUBLIC;
+CREATE EXTENSION postgis WITH SCHEMA pgcf_extensions VERSION '3.7.0';
+CREATE EXTENSION pg_jsonschema WITH SCHEMA pgcf_extensions VERSION '0.3.4';
+SET LOCAL search_path TO pg_catalog, pgcf_extensions;
+CREATE TEMP TABLE sample_store (
+  id integer PRIMARY KEY,
+  point geography(Point, 4326) NOT NULL,
+  attributes jsonb NOT NULL CHECK (
+    jsonb_matches_schema('{"type":"object","required":["count"],"properties":{"count":{"type":"integer"}}}', attributes)
+  )
+);
+CREATE INDEX sample_store_radius ON sample_store USING gist (point);
+INSERT INTO sample_store VALUES
+  (1, ST_SetSRID(ST_MakePoint(13.405, 52.52), 4326), '{"count":3}'),
+  (2, ST_SetSRID(ST_MakePoint(2.352, 48.856), 4326), '{"count":4}');
+GRANT SELECT ON sample_store TO pgcf_extension_probe;
+SET LOCAL enable_seqscan = off;
+SET LOCAL ROLE pgcf_extension_probe;
+DO $$
+DECLARE
+  hits integer[];
+  step text;
+  indexed boolean := false;
+BEGIN
+  SELECT array_agg(id ORDER BY id) INTO hits FROM sample_store
+    WHERE ST_DWithin(point, ST_SetSRID(ST_MakePoint(13.405, 52.52), 4326)::geography, 500);
+  IF hits IS DISTINCT FROM ARRAY[1] THEN RAISE EXCEPTION 'unexpected PostGIS radius result'; END IF;
+  FOR step IN EXPLAIN SELECT id FROM sample_store
+    WHERE ST_DWithin(point, ST_SetSRID(ST_MakePoint(13.405, 52.52), 4326)::geography, 500)
+  LOOP
+    indexed := indexed OR strpos(step, 'sample_store_radius') > 0;
+  END LOOP;
+  IF NOT indexed THEN RAISE EXCEPTION 'PostGIS radius query did not use its index'; END IF;
+  IF jsonb_matches_schema('{"type":"integer"}', '"3"') IS DISTINCT FROM false THEN
+    RAISE EXCEPTION 'pg_jsonschema accepted a wrong-typed JSON value';
+  END IF;
+END $$;
+RESET ROLE;
+DO $$
+BEGIN
+  BEGIN
+    UPDATE sample_store SET attributes = '{"count":"bad"}' WHERE id = 1;
+    RAISE EXCEPTION 'pg_jsonschema constraint accepted an invalid document';
+  EXCEPTION WHEN check_violation THEN
+    NULL;
+  END;
+END $$;
+ROLLBACK;
+SQL
+}
+
 # MountImages= opens the unit's device policy to block devices (DeviceAllow), and the policy is all
 # a database's user would have against the raw volumes of the others if the unit's /dev held a node
 # for one or the user could make one. Inside the running scratch database, as its user with no
@@ -1209,6 +1287,7 @@ if [ "$phase" = 1 ]; then
 	check slot_unit_device_allow slot_unit_device_allow
 	check database_unit_needs_the_link database_unit_needs_the_link
 	check scratch_database_runs_across_an_agent_restart scratch_database_runs_across_an_agent_restart
+	check optional_extension_libraries optional_extension_libraries
 	check database_user_reaches_no_block_device database_user_reaches_no_block_device
 	check database_user_shares_nothing_writable database_user_shares_nothing_writable
 	check database_user_reads_no_journal database_user_reads_no_journal

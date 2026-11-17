@@ -23,6 +23,7 @@ export type Env = Cloudflare.Env & {
   NODE_DNS_SERVERS?: string;
   /** JSON array of qualified signed native release IDs supporting MiB storage and membership flags. */
   NATIVE_EXTENDED_RESOURCES_RELEASE_IDS?: string;
+  NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS?: string;
   /** Explicit rollout switch; turning it off never disables recovery of archived databases. */
   COLD_STORAGE_ARCHIVAL_ENABLED?: string;
   /** Optional JSON allowlist of at most 256 database IDs for new archive claims; invalid/empty admits none. */

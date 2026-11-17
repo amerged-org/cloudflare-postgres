@@ -28,7 +28,11 @@ import {
   archiveCredentialStatement,
   newArchiveCredentialId,
 } from "./archive-credentials.ts";
-import { coldStorageNativeGuard } from "./native-capabilities.ts";
+import {
+  coldStorageNativeGuard,
+  combineNativeGuard,
+  managedExtensionsNativeGuard,
+} from "./native-capabilities.ts";
 import {
   choosePlacement,
   placementNodes,
@@ -52,6 +56,7 @@ const activePhases =
 type Residency = "local" | "archiving" | "archived" | "restoring";
 export interface ColdDatabase {
   id: string;
+  managed_extensions_json: string;
   project_id: string;
   region_id: string;
   node_id: string | null;
@@ -140,6 +145,23 @@ const conflict = () =>
   });
 const noMutation = { sql: "1=1", bindings: [] as (string | number | null)[] };
 
+function coldStorageCapability(
+  env: Env,
+  nodeId: string,
+  database: ColdDatabase,
+  now: number,
+) {
+  return combineNativeGuard(
+    coldStorageNativeGuard(env, { nodeId }, now),
+    managedExtensionsNativeGuard(
+      env,
+      { nodeId },
+      database.managed_extensions_json !== "[]",
+      now,
+    ),
+  );
+}
+
 /** Unset means broad rollout; malformed explicit scope must never broaden it. */
 function archiveDatabaseScope(env: Env): string[] | null {
   if (env.COLD_STORAGE_ARCHIVAL_DATABASE_IDS === undefined) return null;
@@ -196,7 +218,7 @@ export async function startColdStorageArchive(
       .first()
   )
     return null;
-  const capability = coldStorageNativeGuard(env, { nodeId: d.node_id }, now);
+  const capability = coldStorageCapability(env, d.node_id, d, now);
   if (
     !(await env.DB.prepare(`SELECT 1 WHERE ${capability.sql}`)
       .bind(...capability.bindings)
@@ -207,7 +229,7 @@ export async function startColdStorageArchive(
   const nodes = await placementNodes(env.DB, d.region_id, now);
   const eligible = [];
   for (const n of nodes) {
-    const guard = coldStorageNativeGuard(env, { nodeId: n.id }, now);
+    const guard = coldStorageCapability(env, n.id, d, now);
     if (
       await env.DB.prepare(`SELECT 1 WHERE ${guard.sql}`)
         .bind(...guard.bindings)
@@ -225,6 +247,7 @@ export async function startColdStorageArchive(
     pendingStorageMib: verifier.pending_storage_mib,
     now,
   });
+  const verifierCapability = coldStorageCapability(env, verifier.id, d, now);
   await withAdmissionMutation(env, [d.id], async (mutation) => {
     const authority = mutation.guard(d.id);
     const guard = `d.id=? AND d.generation=? AND d.storage_generation=? AND d.node_id=? AND d.archive_path=? AND d.proven_sleep_json=?
@@ -236,7 +259,8 @@ export async function startColdStorageArchive(
       AND NOT EXISTS(SELECT 1 FROM database_moves m WHERE m.database_id=d.id AND m.status IN('proving','restoring'))
       AND NOT EXISTS(SELECT 1 FROM database_replacements p WHERE p.database_id=d.id AND p.phase IN('proving','restoring','rolling_back'))
       AND NOT EXISTS(SELECT 1 FROM archive_retention_claims c WHERE c.archive_path=d.archive_path)
-      AND EXISTS(SELECT 1 FROM nodes n WHERE ${placement.sql}) AND (${capability.sql}) AND (${authority.sql})`;
+      AND EXISTS(SELECT 1 FROM nodes n WHERE ${placement.sql}) AND (${capability.sql})
+      AND (${verifierCapability.sql}) AND (${authority.sql})`;
     const binds = [
       d.id,
       d.generation,
@@ -249,6 +273,7 @@ export async function startColdStorageArchive(
       iso(now - COLD_STORAGE_RETRY_MS),
       ...placement.bindings,
       ...capability.bindings,
+      ...verifierCapability.bindings,
       ...authority.bindings,
     ];
     return mutation.batch([
@@ -750,7 +775,7 @@ export async function placeColdStorageRestore(
   const candidates = await placementNodes(env.DB, row.region_id, now),
     eligible = [];
   for (const n of candidates) {
-    const capable = coldStorageNativeGuard(env, { nodeId: n.id }, now);
+    const capable = coldStorageCapability(env, n.id, d, now);
     if (
       await env.DB.prepare(`SELECT 1 WHERE ${capable.sql}`)
         .bind(...capable.bindings)
@@ -784,7 +809,7 @@ export async function placeColdStorageRestore(
     pendingStorageMib: node.pending_storage_mib,
     now,
   });
-  const capable = coldStorageNativeGuard(env, { nodeId: node.id }, now);
+  const capable = coldStorageCapability(env, node.id, d, now);
   const result = await env.DB.batch([
     env.DB.prepare(
       `UPDATE database_cold_storage SET phase='restoring',target_node_id=?,target_generation=?,target_storage_generation=?,target_archive_path=?,target_started_at=?,updated_at=?
@@ -1311,11 +1336,7 @@ async function finishRestore(
     await failColdStorage(env, row, "database_changed", now);
     return;
   }
-  const capable = coldStorageNativeGuard(
-    env,
-    { nodeId: row.target_node_id! },
-    now,
-  );
+  const capable = coldStorageCapability(env, row.target_node_id!, d, now);
   if (!serving) {
     const next = row.target_generation! + 1;
     await withAdmissionMutation(env, [d.id], async (mutation) => {

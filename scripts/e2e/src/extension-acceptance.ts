@@ -12,6 +12,10 @@
  * by suspending it, physically restore it in EU, then prove the same results and constraints.
  * The run verifies deletion of the databases it owns. Provider retention handles archives.
  * The script reports only stages, counts, versions and redacted error codes.
+ * Once EU1 is qualified for the managed-extension release, use `run-managed` with an
+ * existing PGCF_ADMIN_API_KEY for create-time opt-in. That run uses the disposable
+ * suffixes `managed-src` and `managed-copy` and reads SQL credentials with the scoped
+ * integrator key as before.
  */
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
@@ -142,6 +146,87 @@ export function validateExtensionObservation(value: unknown): Observation {
     serverVersion,
     versions: catalog!.map(([, version]) => version as string),
   };
+}
+
+const managedExtensionNames = ["postgis", "pg_jsonschema"] as const;
+const managedCatalog = [
+  [
+    "pg_jsonschema",
+    "0.3.4",
+    "pgcf_extensions",
+    "postgres",
+    "postgres",
+    "t",
+    "f",
+  ],
+  ["postgis", "3.7.0", "pgcf_extensions", "postgres", "postgres", "t", "f"],
+];
+const center =
+  "pgcf_extensions.ST_SetSRID(pgcf_extensions.ST_MakePoint(13.405, 52.52), 4326)";
+const radiusSearch = `SELECT id FROM public.managed_stores
+  WHERE pgcf_extensions.ST_DWithin(point, ${center}::pgcf_extensions.geography, 500)`;
+const managedFixtureStatements = [
+  `CREATE TABLE public.managed_stores (
+    id integer PRIMARY KEY,
+    point pgcf_extensions.geography(Point, 4326) NOT NULL,
+    attributes jsonb NOT NULL CHECK (pgcf_extensions.jsonb_matches_schema(
+      '{"type":"object","required":["count"],"properties":{"count":{"type":"integer"}}}',
+      attributes
+    ))
+  )`,
+  "CREATE INDEX managed_store_radius ON public.managed_stores USING gist (point pgcf_extensions.gist_geography_ops)",
+  `INSERT INTO public.managed_stores VALUES
+    (1, ${center}::pgcf_extensions.geography, '{"count":3}'),
+    (2, pgcf_extensions.ST_SetSRID(pgcf_extensions.ST_MakePoint(2.352, 48.856), 4326)::pgcf_extensions.geography, '{"count":4}')`,
+];
+const managedObservationStatements = [
+  extensionObservationStatements[0]!,
+  `SELECT e.extname, e.extversion, n.nspname, pg_get_userbyid(e.extowner),
+          pg_get_userbyid(n.nspowner), has_schema_privilege(n.oid, 'USAGE'),
+          has_schema_privilege(n.oid, 'CREATE')
+   FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+   WHERE e.extname IN ('pg_jsonschema', 'postgis')
+   ORDER BY e.extname`,
+  `SELECT (${radiusSearch}),
+          (SELECT attributes->>'count' FROM public.managed_stores WHERE id = 1),
+          pgcf_extensions.jsonb_matches_schema('{"type":"integer"}', '"3"'::jsonb)`,
+  "SET LOCAL enable_seqscan = off",
+  `EXPLAIN (COSTS OFF) ${radiusSearch}`,
+];
+
+export function validateManagedExtensionObservation(
+  value: unknown,
+): Observation {
+  const [server, catalog, witnesses, , plan] = resultRows(
+    value,
+    managedObservationStatements.length,
+  );
+  const serverVersion = patchedOwner(server!);
+  if (JSON.stringify(catalog) !== JSON.stringify(managedCatalog))
+    throw new HarnessError("managed_extension_catalog");
+  if (JSON.stringify(witnesses) !== JSON.stringify([["1", "3", "f"]]))
+    throw new HarnessError("managed_extension_results");
+  if (
+    !plan!.some(
+      ([line]) =>
+        typeof line === "string" &&
+        /(?:Bitmap Index Scan on|Index Scan using) managed_store_radius\b/.test(
+          line,
+        ),
+    )
+  )
+    throw new HarnessError("postgis_radius_index_plan");
+  return { serverVersion, versions: managedCatalog.map((row) => row[1]!) };
+}
+
+function checkManagedExtensions(database: unknown): void {
+  const { managed_extensions: selected } = record(database);
+  if (
+    !Array.isArray(selected) ||
+    selected.length !== managedExtensionNames.length ||
+    !managedExtensionNames.every((name) => selected.includes(name))
+  )
+    throw new HarnessError("unexpected_managed_extension_scope");
 }
 
 type Context = Readonly<{
@@ -413,6 +498,20 @@ async function observe(uri: URL): Promise<Observation> {
   return result;
 }
 
+async function observeManaged(uri: URL): Promise<Observation> {
+  const result = validateManagedExtensionObservation(
+    await sql(uri, managedObservationStatements),
+  );
+  await sql(
+    uri,
+    [
+      'UPDATE public.managed_stores SET attributes = \'{"count":"bad"}\' WHERE id = 1',
+    ],
+    "23514",
+  );
+  return result;
+}
+
 async function cleanup(context: Context, fixture: Fixture): Promise<void> {
   if (fixture.id === undefined) {
     // A lost create reply can leave a live fixture. Reconcile by the exact random name
@@ -480,17 +579,32 @@ async function checkUnusedName(
     throw new HarnessError("fixture_name_in_use");
 }
 
-async function createFixture(context: Context, fixture: Fixture): Promise<URL> {
+async function createFixture(
+  context: Context,
+  fixture: Fixture,
+  managedAdminKey?: string,
+): Promise<URL> {
   const created = await json(
-    await management(context, "POST", "/v1/databases", {
-      name: fixture.name,
-      project_id: context.project,
-      region_id: context.region,
-      size_class_id: context.sizeClass,
-    }),
+    await management(
+      managedAdminKey === undefined
+        ? context
+        : { ...context, key: managedAdminKey },
+      "POST",
+      "/v1/databases",
+      {
+        name: fixture.name,
+        project_id: context.project,
+        region_id: context.region,
+        size_class_id: context.sizeClass,
+        ...(managedAdminKey === undefined
+          ? {}
+          : { managed_extensions: managedExtensionNames }),
+      },
+    ),
     "create",
   );
   fixture.id = ownedDatabase(context, fixture, created.database);
+  if (managedAdminKey !== undefined) checkManagedExtensions(created.database);
   await operation(context, created.operation, fixture.id, "database.create");
   await state(context, fixture, "ready");
   const uri = await connectionUri(context, fixture.id);
@@ -584,19 +698,24 @@ export async function withEu1Fixture<T>(
   return value;
 }
 
-async function run(context: Context): Promise<void> {
-  const source = newFixture("source");
-  const target = newFixture("restored");
+async function run(context: Context, managed: boolean): Promise<void> {
+  const adminKey = managed ? variable("PGCF_ADMIN_API_KEY") : undefined;
+  const source = newFixture(managed ? "managed-src" : "source");
+  const target = newFixture(managed ? "managed-copy" : "restored");
+  const observeFixture = managed ? observeManaged : observe;
   const attempted: Fixture[] = [];
   for (const fixture of [source, target])
     await checkUnusedName(context, fixture);
   let cleanupFailed = false;
   try {
     attempted.push(source);
-    const sourceUri = await createFixture(context, source);
+    const sourceUri = await createFixture(context, source, adminKey);
     const sourceId = string(source.id);
-    await sql(sourceUri, extensionFixtureStatements);
-    const sourceObservation = await observe(sourceUri);
+    await sql(
+      sourceUri,
+      managed ? managedFixtureStatements : extensionFixtureStatements,
+    );
+    const sourceObservation = await observeFixture(sourceUri);
     report("source_index_and_constraints", true, sourceObservation);
 
     const suspended = await json(
@@ -636,13 +755,22 @@ async function run(context: Context): Promise<void> {
     );
     target.id = ownedDatabase(context, target, restored.target_database);
     if (target.id === sourceId) throw new HarnessError("restore_reused_source");
+    if (managed) checkManagedExtensions(restored.target_database);
     await operation(context, restored.operation, target.id, "database.restore");
     await state(context, target, "ready");
     const targetUri = await connectionUri(context, target.id);
-    const targetObservation = await observe(targetUri);
+    const targetObservation = await observeFixture(targetUri);
     if (JSON.stringify(targetObservation) !== JSON.stringify(sourceObservation))
       throw new HarnessError("restore_extension_version_mismatch");
-    await sql(targetUri, ["INSERT INTO public.restore_marker VALUES (1)"]);
+    if (managed) {
+      const result = await sql(targetUri, [
+        "UPDATE public.managed_stores SET attributes = '{\"count\":8}' WHERE id = 1 RETURNING attributes->>'count'",
+      ]);
+      if (JSON.stringify(resultRows(result, 1)[0]) !== JSON.stringify([["8"]]))
+        throw new HarnessError("managed_extension_restore_write");
+    } else {
+      await sql(targetUri, ["INSERT INTO public.restore_marker VALUES (1)"]);
+    }
     report("restored_index_constraints_and_write", true, targetObservation);
   } finally {
     for (const fixture of attempted.reverse()) {
@@ -661,9 +789,10 @@ async function run(context: Context): Promise<void> {
 
 if (import.meta.main) {
   try {
-    if (process.argv.length !== 3 || process.argv[2] !== "run")
-      throw new HarnessError("usage_extensions_run");
-    await run(configuration());
+    const mode = process.argv[2];
+    if (process.argv.length !== 3 || (mode !== "run" && mode !== "run-managed"))
+      throw new HarnessError("usage_extensions_run_or_run_managed");
+    await run(configuration(), mode === "run-managed");
   } catch (error) {
     // Neither HTTP bodies nor exception messages from native clients are operator output.
     console.error(

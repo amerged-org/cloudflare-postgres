@@ -19,7 +19,7 @@ use crate::{
     },
     credentials::Access,
     machine::{Account, Machine},
-    pg_control, pgcf, postgres, proof, roles,
+    managed_extensions, pg_control, pgcf, postgres, proof, roles,
     settings::{self, Settings},
     sleep,
     state::{self, DatabaseState},
@@ -991,6 +991,9 @@ impl<M: Machine> Core<M> {
         // checkpoint would write them as WAL, a segment the sleep proof then finds unarchived. The
         // database is new and empty of tenant data, so the VACUUM is cheap.
         let tenant = pgcf::connect(&self.layout().socket_directory(id), id, None)
+            .await
+            .map_err(|_| build_failed!())?;
+        managed_extensions::install(&tenant, &entry.managed_extensions)
             .await
             .map_err(|_| build_failed!())?;
         tenant

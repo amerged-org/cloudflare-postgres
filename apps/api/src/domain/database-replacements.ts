@@ -13,8 +13,10 @@ import {
 import { ApiError } from "../api-error.ts";
 import { deleteUnpinnedArchiveKeys } from "./archive-retention-claims.ts";
 import {
+  combineNativeGuard,
   databaseNeedsExtended,
   requireExtendedNative,
+  requireManagedExtensionsNative,
 } from "./native-capabilities.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -166,11 +168,20 @@ export async function startDatabaseReplacement(
         throw new ApiError("conflict", "Database configuration is not ready", {
           reason: "not_ready",
         });
-      const native = await requireExtendedNative(
-        c.env,
-        { nodeId: source.node_id },
-        await databaseNeedsExtended(c.env, id),
-        now,
+      const native = combineNativeGuard(
+        await requireExtendedNative(
+          c.env,
+          { nodeId: source.node_id },
+          await databaseNeedsExtended(c.env, id),
+          now,
+        ),
+        await requireManagedExtensionsNative(
+          c.env,
+          { nodeId: source.node_id },
+          source.managed_extensions_json !== undefined &&
+            source.managed_extensions_json !== "[]",
+          now,
+        ),
       );
       const resources = await c.env.DB.prepare(
         "SELECT memory_mib,cpu_millicores,storage_mib FROM database_resources WHERE database_id=?",

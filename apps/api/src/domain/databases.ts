@@ -16,6 +16,7 @@ import {
   databaseNeedsExtended,
   needsExtendedStorage,
   requireExtendedNative,
+  requireManagedExtensionsNative,
 } from "./native-capabilities.ts";
 import { admissionScopesOpenSql } from "./admission-state.ts";
 import type { ApiContext, Env } from "../env.ts";
@@ -112,6 +113,9 @@ export function databaseInsertStatement(
   snapshot: DatabaseInsertSnapshot,
 ): D1PreparedStatement {
   const own = snapshot.resources ?? NO_OVERRIDES,
+    extensions = JSON.stringify(
+      [...(snapshot.body.managed_extensions ?? [])].sort(),
+    ),
     ownValues = [own.memory_mib, own.cpu_millicores, own.storage_mib],
     sizeValues = [
       snapshot.size.memory_mib,
@@ -125,8 +129,8 @@ export function databaseInsertStatement(
   if (snapshot.nodeId === null) {
     return db
       .prepare(
-        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,own_memory_mib,own_cpu_millicores,own_storage_mib)
-      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,?,?,?
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,status_message,created_at,updated_at,own_memory_mib,own_cpu_millicores,own_storage_mib,managed_extensions_json)
+      SELECT ?,p.id,r.id,NULL,?,s.id,?,'running',1,?,'Waiting for verified regional capacity',?,?,?,?,?,?
       FROM projects p JOIN regions r ON r.id=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_mib=? AND s.cpu_millicores=?
       AND ${admissionScopesOpenSql("p.id", "r.id", "NULL")}
@@ -141,6 +145,7 @@ export function databaseInsertStatement(
         snapshot.now,
         snapshot.now,
         ...ownValues,
+        extensions,
         snapshot.body.region_id,
         snapshot.body.size_class_id,
         snapshot.body.project_id,
@@ -156,8 +161,8 @@ export function databaseInsertStatement(
   });
   return db
     .prepare(
-      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib,own_cpu_millicores,own_storage_mib)
-            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,?,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
+      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,sleep_after_seconds,desired_state,generation,archive_path,created_at,updated_at,placed_at,own_memory_mib,own_cpu_millicores,own_storage_mib,managed_extensions_json)
+            SELECT ?,p.id,n.region_id,n.id,?,s.id,?,'running',1,?,?,?,?,?,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id
             WHERE n.region_id=? AND ${guard.sql}
             AND ${admissionScopesOpenSql("p.id", "r.id", "n.id")}
@@ -173,6 +178,7 @@ export function databaseInsertStatement(
       snapshot.now,
       snapshot.now,
       ...ownValues,
+      extensions,
       snapshot.body.project_id,
       snapshot.body.size_class_id,
       snapshot.body.region_id,
@@ -190,6 +196,11 @@ export async function createDatabase(
     throw new ApiError(
       "forbidden",
       "Only an admin key sets a database's own resources",
+    );
+  if (body.managed_extensions !== undefined && auth.scope !== "admin")
+    throw new ApiError(
+      "forbidden",
+      "Only an admin key selects managed extensions",
     );
   return withIdempotency(c, {
     replay: (id, status) => databaseOperationResponse(c, id, status),
@@ -221,10 +232,17 @@ export async function createDatabase(
         own,
         await regionBounds(c.env.DB, region.id),
       );
-      const native = await requireExtendedNative(
-        c.env,
-        { regionId: region.id },
-        needsExtendedStorage(effective.storage_mib),
+      const native = combineNativeGuard(
+        await requireExtendedNative(
+          c.env,
+          { regionId: region.id },
+          needsExtendedStorage(effective.storage_mib),
+        ),
+        await requireManagedExtensionsNative(
+          c.env,
+          { regionId: region.id },
+          body.managed_extensions !== undefined,
+        ),
       );
       const id = newDatabaseId(),
         op = newOperationId(),
