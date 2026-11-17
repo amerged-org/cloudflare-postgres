@@ -39,13 +39,13 @@ upstream source is vendored here.
 
 The gateway's direct crates are httparse 1.10.1, time 0.3.55, futures-util 0.3.34, serde 1.0.229,
 serde_json 1.0.151, sha2 0.11.0, hmac 0.13.0 and base64 0.23.1 (all `MIT OR Apache-2.0`), zeroize
-1.9.1 (`Apache-2.0 OR MIT`), ring 0.17.14 (`Apache-2.0 AND ISC`), and tokio 1.53.2 and
+1.9.1 (`Apache-2.0 OR MIT`), ring 0.17.14 (`Apache-2.0 AND ISC`), and tokio 1.53.3 and
 tokio-tungstenite 0.30.0 (MIT). The protocol crate adds regex 1.13.1 (`MIT OR Apache-2.0`) and,
 outside Wasm, time 0.3.55 (the agent channel's timestamps). The node agent adds reqwest 0.13.5,
 rustls-pki-types 1.15.1, tokio-postgres 0.7.18 and libc 0.2.190 (`MIT OR Apache-2.0`), rustls
-0.23.45 and tokio-rustls 0.26.6 (`Apache-2.0 OR ISC OR MIT` and `MIT OR Apache-2.0`), jsonschema
+0.23.46 and tokio-rustls 0.26.6 (`Apache-2.0 OR ISC OR MIT` and `MIT OR Apache-2.0`), jsonschema
 0.58.6 and zbus 5.19.0 (MIT; zbus drives the database units over systemd's D-Bus API), and
-webpki-roots 1.0.9 (`CDLA-Permissive-2.0`). The agent signs the node's requests with its Ed25519
+webpki-roots 1.0.10 (`CDLA-Permissive-2.0`). The agent signs the node's requests with its Ed25519
 key through ring, checks the Ed25519 signature of each release against the release key through
 the same crate (`ring::signature::ED25519`; no crate was added for release signing, and the
 script that makes and checks the key uses Node's own `node:crypto`), and speaks the link's TLS

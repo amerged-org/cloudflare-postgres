@@ -13,10 +13,23 @@ reported the lock current. All 92 local image and installer checks passed. A rea
 of one retained test data directory from 18.6 to 18.7 preserved two vector values and both tested
 RLS row sets. The kernel change requires a reboot in each region's maintenance cycle.
 
+The local candidate OS image built from the new lock and the previous signed native binaries
+passed 62 QEMU checks across two boots. The compressed image was 277,745,811 bytes and passed
+the registration dry-run. Its package-set digest is
+`f03df91dcc0d8820bece6a5ff290cefd19b22cf6e9216801f5ad64a46551c98a`. The signed production
+artifact still depends on the workflow build with the refreshed native binaries.
+
+The pinned RustSec audit reported eight vulnerability entries on the previous Cargo lock and
+zero on the candidate after updating seven compatible dependencies. Four maintenance warnings
+remain in the zbus family and Chrono. Tokio's registration changes keep the inotify descriptor
+and duplicated pidfd owned throughout registration. The native binaries will be rebuilt from the
+candidate lock by CI.
+
 Seventy-one focused Worker and D1 tests passed, including a generic response on terminal audit
 write failure, a lost D1 acknowledgement retry, role creation and password revision metadata
 from one row, and equal absent-resource responses for project-scoped lookups. The additive
-`0101_credential_disclosures.sql` follows the archive digest migrations.
+`0101_credential_disclosures.sql` follows the archive digest migrations. The complete local API
+suite passed 1,481 tests across 150 files, and the Worker bundle built in a deployment dry-run.
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)
