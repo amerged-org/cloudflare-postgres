@@ -22,14 +22,16 @@ artifact still depends on the workflow build with the refreshed native binaries.
 The pinned RustSec audit reported eight vulnerability entries on the previous Cargo lock and
 zero on the candidate after updating seven compatible dependencies. Four maintenance warnings
 remain in the zbus family and Chrono. Tokio's registration changes keep the inotify descriptor
-and duplicated pidfd owned throughout registration. The native binaries will be rebuilt from the
-candidate lock by CI.
+and duplicated pidfd owned throughout registration. All 11 Linux descriptor and 67 node-link tests
+passed. The native binaries will be rebuilt from the candidate lock by CI.
 
 Seventy-one focused Worker and D1 tests passed, including a generic response on terminal audit
 write failure, a lost D1 acknowledgement retry, role creation and password revision metadata
 from one row, and equal absent-resource responses for project-scoped lookups. The additive
 `0101_credential_disclosures.sql` follows the archive digest migrations. The complete local API
 suite passed 1,481 tests across 150 files, and the Worker bundle built in a deployment dry-run.
+Hosted CI exposed a race in an existing wake-claim test. The test now waits for the asynchronous
+node hint after checking the SQL ordering. All five tests in that file passed locally.
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)
