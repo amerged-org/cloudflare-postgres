@@ -35,7 +35,7 @@
       },
       {
         "id": "03-ready",
-        "label": "Ready: place eligible new databases and hint their nodes",
+        "label": "Ready: place databases on compatible nodes and hint those nodes",
         "evidence": [
           {
             "line": 213,
@@ -44,9 +44,9 @@
             "symbol": "AddNode"
           },
           {
-            "line": 42,
+            "line": 44,
             "path": "apps/api/src/domain/node-capacity.ts",
-            "sha256": "a15c9ff32cd4f33f4dc10a09d32e60bbbf47093500f71bb575699ea9e4c6ed8a",
+            "sha256": "af793285cb03333b6fb9c74c70e1ede05ff82d1861389fcbf7d0b8b2cc2f3da3",
             "symbol": "placePendingDatabases"
           }
         ]

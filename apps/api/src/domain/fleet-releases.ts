@@ -33,6 +33,7 @@ import {
   coldStorageNativeReleaseIds,
   combineNativeGuard,
   extendedReleaseAssignmentGuard,
+  managedExtensionsAssignmentGuard,
 } from "./native-capabilities.ts";
 
 function canonical(value: unknown): string {
@@ -257,13 +258,16 @@ export async function assignFleetRegionRelease(
     replay: read,
     execute: async (lease) => {
       const native = combineNativeGuard(
-        extendedReleaseAssignmentGuard(c.env, regionId, input.release_id),
-        coldStorageNativeReleaseIds(c.env).includes(input.release_id)
-          ? { sql: "1=1", bindings: [] }
-          : {
-              sql: "EXISTS(SELECT 1 FROM regions WHERE id=? AND native_cold_storage_required=0)",
-              bindings: [regionId],
-            },
+        combineNativeGuard(
+          extendedReleaseAssignmentGuard(c.env, regionId, input.release_id),
+          coldStorageNativeReleaseIds(c.env).includes(input.release_id)
+            ? { sql: "1=1", bindings: [] }
+            : {
+                sql: "EXISTS(SELECT 1 FROM regions WHERE id=? AND native_cold_storage_required=0)",
+                bindings: [regionId],
+              },
+        ),
+        managedExtensionsAssignmentGuard(c.env, regionId, input.release_id),
       );
       if (
         !(await c.env.DB.prepare(`SELECT 1 WHERE ${native.sql}`)
@@ -275,12 +279,30 @@ export async function assignFleetRegionRelease(
           "This region has used formats requiring a qualified native release; downgrade is refused",
           { reason: "not_ready" },
         );
-      const results = await c.env.DB.batch([
+      // Persist qualification and the assignment under the same revision, native controls and
+      // idempotent write lease. A refused assignment must leave no new approval behind.
+      const assign = {
+        sql: `EXISTS(SELECT 1 FROM regions WHERE id=?)
+          AND COALESCE((SELECT revision FROM fleet_region_releases WHERE region_id=?),0)=?
+          AND (${lease.guard.sql}) AND (${native.sql})`,
+        bindings: [
+          regionId,
+          regionId,
+          input.expected_revision,
+          ...lease.guard.bindings,
+          ...native.bindings,
+        ],
+      };
+      const [, result] = await c.env.DB.batch([
+        c.env.DB.prepare(
+          `INSERT INTO managed_extension_region_releases(region_id,release_id)
+          SELECT ?,? WHERE (${assign.sql})
+          AND EXISTS(SELECT 1 FROM regions WHERE id=? AND native_managed_extensions_required=1)
+          ON CONFLICT(region_id,release_id) DO NOTHING`,
+        ).bind(regionId, input.release_id, ...assign.bindings, regionId),
         c.env.DB.prepare(
           `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at)
-          SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM regions WHERE id=?)
-            AND (?=0 OR EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND revision=?))
-            AND (${lease.guard.sql}) AND (${native.sql})
+          SELECT ?,?,?,? WHERE (${assign.sql})
           ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,
             revision=excluded.revision,updated_at=excluded.updated_at WHERE fleet_region_releases.revision=?`,
         ).bind(
@@ -288,12 +310,7 @@ export async function assignFleetRegionRelease(
           input.release_id,
           input.expected_revision + 1,
           new Date().toISOString(),
-          regionId,
-          input.expected_revision,
-          regionId,
-          input.expected_revision,
-          ...lease.guard.bindings,
-          ...native.bindings,
+          ...assign.bindings,
           input.expected_revision,
         ),
         lease.completeStatement(regionId, 200, {
@@ -301,7 +318,7 @@ export async function assignFleetRegionRelease(
           bindings: [],
         }),
       ]);
-      if (results[0]!.meta.changes !== 1)
+      if (result!.meta.changes !== 1)
         return conflict("Region release assignment changed");
       // The nodes of the region pull the page that names the release.
       const nodes = await c.env.DB.prepare(

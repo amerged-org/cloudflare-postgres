@@ -53,6 +53,12 @@ test("the lock pins the plan's component versions", () => {
   assert.equal(version("postgresql-client-18"), "18.7-1.pgdg13+2");
   assert.equal(version("libpq5"), "18.7-1.pgdg13+2");
   assert.equal(version("postgresql-18-pgvector"), "0.8.7-1.pgdg13+2");
+  assert.equal(version("postgresql-18-postgis-3"), "3.7.0+dfsg-1.pgdg13+2");
+  assert.equal(version("postgresql-18-postgis-3-scripts"), "3.7.0+dfsg-1.pgdg13+2");
+  assert.equal(version("pg-jsonschema-postgresql-18"), "0.3.4");
+  const upstream = lock.extra.find((entry) => entry.name === "pg-jsonschema-postgresql-18");
+  assert.equal(upstream?.architecture, "amd64");
+  assert.equal(upstream?.sha256, "5c7fe6c810835e4242fb0365b57581c0009b0155200dd4f1266cee434295732f");
   assert.equal(version("barman-cli-cloud"), "3.20.1-1.pgdg13+1");
   assert.equal(version("cloudflared"), "2026.11.1");
 });
@@ -351,7 +357,10 @@ test("the packages pinned in mkosi.conf are read from its Packages list", () => 
     "barman-cli-cloud",
     "cloudflared",
     "libpq5",
+    "pg-jsonschema-postgresql-18",
     "postgresql-18",
     "postgresql-18-pgvector",
+    "postgresql-18-postgis-3",
+    "postgresql-18-postgis-3-scripts",
   ]);
 });

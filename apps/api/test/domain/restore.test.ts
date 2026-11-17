@@ -9,6 +9,7 @@ import {
   desiredPage,
   lostConnection,
   nodeKeyPair,
+  qualifyExtendedNative,
   rawRequest,
   refusal,
   request,
@@ -37,10 +38,11 @@ afterEach(async () => {
 });
 async function archived(
   prepare?: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>,
+  create = (f: Awaited<ReturnType<typeof fixture>>) => f.create(),
 ) {
   const f = await fixture();
   if (prepare) await prepare(f);
-  const response = await f.create();
+  const response = await create(f);
   const { database } = (await response.json()) as {
     database: { id: string; generation: number };
   };
@@ -95,6 +97,53 @@ it("creates and restores a database in a region whose node release is assigned",
     { name: "after-release", mode: "full" },
   );
   expect(restored.status).toBe(202);
+});
+
+it("preserves managed packages on restore of a deleted source and refuses an unqualified region", async () => {
+  let releaseId = "";
+  const bind = () => ({
+    NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS: JSON.stringify([releaseId]),
+  });
+  const f = await archived(
+    async (fixture) => {
+      releaseId = (await qualifyExtendedNative(fixture)).id;
+    },
+    async (fixture) =>
+      request(
+        "/v1/databases",
+        fixture.admin,
+        "POST",
+        {
+          project_id: fixture.project,
+          region_id: fixture.region,
+          size_class_id: fixture.size,
+          name: "managed-source",
+          managed_extensions: ["postgis"],
+        },
+        undefined,
+        undefined,
+        bind(),
+      ),
+  );
+  expect(
+    (await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")).status,
+  ).toBe(202);
+  const restore = (bindings: Partial<Env>) =>
+    request(
+      `/v1/databases/${f.id}/restore`,
+      f.integrator,
+      "POST",
+      { name: "managed-restored", mode: "full" },
+      undefined,
+      undefined,
+      bindings,
+    );
+  expect((await restore({})).status).toBe(409);
+  const restored = await restore(bind());
+  expect(restored.status).toBe(202);
+  expect(await restored.json()).toMatchObject({
+    target_database: { managed_extensions: ["postgis"] },
+  });
 });
 it("a delayed new-ID restore batch cannot create an unreceipted target after its lease is removed", async () => {
   const f = await archived(),

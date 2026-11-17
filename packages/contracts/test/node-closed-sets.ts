@@ -43,6 +43,11 @@ export const NODE_CLOSED_SETS: Record<string, (string | number | boolean)[]> = {
     "suspended",
   ],
   "NodeDesiredPage.databases[].pg_major": [18],
+  // The Worker sends the opt-in only to its verified, qualified native release set.
+  "NodeDesiredPage.databases[].managed_extensions[]": [
+    "pg_jsonschema",
+    "postgis",
+  ],
   "NodeDesiredPage.databases[].roles[]|0.bypass_rls": [true],
   "NodeDesiredPage.databases[].roles[]|1.state": ["absent"],
   "NodeDesiredPage.databases[].origin|kind=create.kind": ["create"],

@@ -37,6 +37,48 @@ two unrelated API tests exceeded their fixture timeouts and a role publication a
 observed 3,160 ms against its 3,000 ms bound. The GitHub API job now runs its Workerd test files
 serially with the same assertions and deadlines. All 53 tests of the affected files passed
 in that runner mode locally.
+**Signed release readback — 2026-11-18.** [PR #59](https://github.com/amerged-org/cloudflare-postgres/pull/59)
+merged as `749bab1b8c87e221099f303301d50be53e4dec14`. The second attempt of
+[the main workflow](https://github.com/amerged-org/cloudflare-postgres/actions/runs/44191140908)
+passed and signed release `sha-749bab1b8c87`. Independent download verified all seven
+SHA-256 entries and the Ed25519 signature. The image is 277,801,495 compressed bytes. A
+registration dry-run verified kernel `6.12.117+deb13-amd64` and package-set digest
+`f03df91dcc0d8820bece6a5ff290cefd19b22cf6e9216801f5ad64a46551c98a`. EU1 still reported
+its previous release `sha-d6a2152015e5` and placement was open. The stored Cloudflare
+credential was refused by Workers, D1 and R2 with HTTP 401. Registration, rollout and live
+acceptance remain open.
+
+# Application features proposed — 2026-11-17
+
+The [application feature design and task plans](2026-11-17-postgres-application-features.md)
+cover opt-in PostgreSQL extensions, preservation of application access rules during a
+Supabase import and authorized browser notifications for committed changes. Each track
+has an independent release gate.
+
+**Trigram search, local qualification.** Digest-verified Debian packages for the deployed
+PostgreSQL 18.6 and the proposed 18.7 security update both supply trusted `pg_trgm` 1.6.
+The local PostgreSQL 18.6 role suite executed 11 tests without failure or skips. The new test
+uses the regular database owner, verifies opt-in and repeated activation, returns the expected
+match through the GIN index and confirms another database remains unconfigured. EU1 acceptance
+still requires the security update and an extension query on the restored target.
+
+**EU1 acceptance runners prepared.** The extension runner checks six opt-in modules on one
+explicitly selected EU1 node, including GIN search and constraint behavior before and after a
+physical restore. The RLS runner checks the local compatibility report and uses separate
+restricted PostgreSQL logins for the source and converted policies. The same RLS witness
+confirmed three retained or translated policies and eight equal access decisions on disposable
+local PostgreSQL databases. Both runners require a patched engine on EU1 and confirm cleanup of
+their disposable databases.
+
+**Managed PostGIS and JSON Schema, local qualification on 2026-11-18.** The opt-in is an
+administrator selection for a new database. The agent installs the requested versions in a
+protected schema before the first backup. D1 retains the selection for physical restore and
+refuses assignments outside the recorded qualified region and release pairs after the first
+opt-in. The optional image pins PostGIS 3.7.0 and `pg_jsonschema` 0.3.4. The resolver added
+106 packages to the security lock without changing existing package versions. The 342,851,170-byte
+compressed image passed 63 checks over two local QEMU boots using verified earlier native binaries.
+The patched candidate's signed build, rollout and restore acceptance remain open.
+
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)

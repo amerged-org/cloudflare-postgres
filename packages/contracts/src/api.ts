@@ -30,7 +30,7 @@ export { Timestamp, roleExpiryInstant } from "./timestamp.ts";
  * Raise the major for a change a client written against the previous version can break on, the
  * minor for an addition, and the patch for a correction of the documentation alone.
  */
-export const API_CONTRACT_VERSION = "1.8.0";
+export const API_CONTRACT_VERSION = "1.9.0";
 
 /** The pattern of `Timestamp` in the contract's own JSON Schema, which the OpenAPI generator drops. */
 export const TIMESTAMP_PATTERN: string = (() => {
@@ -449,6 +449,17 @@ export const ColdSnapshotStorage = z
   .meta({ id: "ColdSnapshotStorage" });
 export type ColdSnapshotStorage = z.infer<typeof ColdSnapshotStorage>;
 
+export const ManagedExtensions = z
+  .array(z.enum(["pg_jsonschema", "postgis"]))
+  .min(1)
+  .max(2)
+  .refine(
+    (names) => new Set(names).size === names.length,
+    "Extension names must be distinct",
+  )
+  .meta({ uniqueItems: true });
+export type ManagedExtensions = z.infer<typeof ManagedExtensions>;
+
 export const Database = z
   .strictObject({
     id: DatabaseId,
@@ -457,6 +468,9 @@ export const Database = z
     node_id: NodeId.nullable(),
     name: DatabaseName,
     size_class_id: SizeClassId,
+    managed_extensions: ManagedExtensions.optional().describe(
+      "The controlled extension selection for this storage lineage. The database becomes ready after the initial installation.",
+    ),
     resources: DatabaseEffectiveResources.describe(
       "The memory, CPU and storage the database runs with: its own values set through PUT /v1/databases/{id}/resources, else its size class's.",
     ),
@@ -518,6 +532,9 @@ export const DatabaseCreate = z
     region_id: RegionId,
     name: DatabaseName,
     size_class_id: SizeClassId,
+    managed_extensions: ManagedExtensions.optional().describe(
+      "Admin-only opt-in on a new database in a region with a qualified image. The selection also applies to physical restores.",
+    ),
     sleep_after_seconds: DatabaseSleepAfter.optional(),
     resources: DatabaseResourcesCreate.describe(
       "The database's own memory, CPU and storage instead of its size class's. Admin keys only (403 otherwise).",

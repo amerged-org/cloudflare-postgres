@@ -27,6 +27,7 @@ export { ProvenSleepRecord, WAL_SEGMENT_PATTERN } from "./postgres-storage.ts";
 import {
   BucketName,
   HttpsUrl,
+  ManagedExtensions,
   ROLE_CONNECTION_LIMIT_MAX,
   ROLE_LIMIT,
   ROLE_MEMBER_OF_MAX,
@@ -1044,6 +1045,8 @@ export const NodeDesiredDatabase = z
     /** A cold target remains awake while Cloudflare completes its serving handoff. */
     cold_snapshot_pending: z.boolean().optional(),
     pg_major: z.literal(18),
+    /** When omitted, the database requires no managed extension packages. */
+    managed_extensions: ManagedExtensions.optional(),
     /** The effective resources: the class's, or the database's own override. */
     resources: DatabaseEffectiveResources,
     settings: z.strictObject({

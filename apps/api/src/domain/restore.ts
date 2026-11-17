@@ -7,8 +7,10 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import {
+  combineNativeGuard,
   needsExtendedStorage,
   requireExtendedNative,
+  requireManagedExtensionsNative,
 } from "./native-capabilities.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
@@ -26,6 +28,7 @@ import {
   databaseForRequest,
   databaseView,
   isConstraintError,
+  managedExtensionsOf,
   operationForRequest,
   operationView,
   type RoleRow,
@@ -215,11 +218,19 @@ export async function restoreDatabase(
               .all<RoleRow>()
           ).results;
       const issuer = (await getAuth(c)).id;
-      const native = await requireExtendedNative(
-        c.env,
-        { regionId: region.id },
-        needsExtendedStorage(effective.storage_mib) ||
-          stored.some((role) => (role.membership_options ?? 3) !== 3),
+      const managedExtensions = managedExtensionsOf(source);
+      const native = combineNativeGuard(
+        await requireExtendedNative(
+          c.env,
+          { regionId: region.id },
+          needsExtendedStorage(effective.storage_mib) ||
+            stored.some((role) => (role.membership_options ?? 3) !== 3),
+        ),
+        await requireManagedExtensionsNative(
+          c.env,
+          { regionId: region.id },
+          managedExtensions !== undefined,
+        ),
       );
       if (stored.filter((r) => r.owner === 1).length !== 1)
         throw new ApiError("conflict", "Source credentials are unavailable", {
@@ -309,6 +320,7 @@ export async function restoreDatabase(
             size_class_id: source.size_class_id,
             sleep_after_seconds: source.sleep_after_seconds ?? null,
             name: body.name,
+            managed_extensions: managedExtensions,
           },
           size,
           resources: own,

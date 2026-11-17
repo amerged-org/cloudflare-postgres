@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   Database,
+  ManagedExtensions,
   Operation,
   Role,
   SizeClass,
@@ -62,6 +63,7 @@ export interface DatabaseRow extends DatabaseHealthSource {
   observed_generation: number;
   status_message: string | null;
   archive_path: string;
+  managed_extensions_json?: string;
   archiving_health: "ok" | "failing" | "unknown";
   archiving_health_since: string | null;
   /** The size of the database's filesystem as its node last told it; null until it has. */
@@ -95,6 +97,15 @@ export interface RoleRow {
   created_by_key_id: string | null;
   deleted_by_key_id: string | null;
   delete_operation_id: string | null;
+}
+
+export function managedExtensionsOf(row: {
+  managed_extensions_json?: string;
+}): ManagedExtensions | undefined {
+  const value = row.managed_extensions_json;
+  return value === undefined || value === "[]"
+    ? undefined
+    : ManagedExtensions.parse(JSON.parse(value));
 }
 export interface OperationRow {
   id: string;
@@ -139,6 +150,9 @@ export function databaseView(row: DatabaseRow, now = Date.now()): Database {
     node_id: row.node_id,
     name: row.name,
     size_class_id: row.size_class_id,
+    ...(row.managed_extensions_json && row.managed_extensions_json !== "[]"
+      ? { managed_extensions: managedExtensionsOf(row) }
+      : {}),
     resources: { ...resources, ...serializeStorage(storage_mib) },
     sleep_after_seconds: row.sleep_after_seconds ?? null,
     effective_sleep_after_seconds: row.effective_sleep_after_seconds,

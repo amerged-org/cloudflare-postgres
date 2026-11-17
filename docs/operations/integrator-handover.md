@@ -669,6 +669,53 @@ is DONE, so it is never writable before it is restorable. The idle time
 - Engine: PostgreSQL 18 (18.6 at the time of writing, unmodified engine, `pgvector` 0.8.7). Which
   other extensions the owner role may create is **not yet verified**.
 
+#### Opt-in trigram search
+
+The pinned PostgreSQL packages contain the trusted `pg_trgm` extension, version 1.6.
+The node agent's real-PostgreSQL test checks that the database owner can install it in a schema
+the owner controls and use a GIN index for similarity search. This is local role and engine
+coverage. EU1 activation and physical restore acceptance are open.
+
+Run the following as the database owner or as a migration role with `CREATE` on the selected
+database. The example assumes the migration role owns `public.products(id, name text)`. If
+the extension already exists, check its version and schema in `pg_extension` and `pg_namespace`.
+Use its installed schema to qualify the operator and index class. PostgreSQL's `IF NOT EXISTS`
+retains the existing installation. Verify the schema owner and its grants before reusing it.
+
+```sql
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
+CREATE INDEX products_name_trgm ON public.products USING gin (name extensions.gin_trgm_ops);
+SELECT id, name FROM public.products WHERE name OPERATOR(extensions.%) 'Schmit';
+```
+
+Activation affects only the selected database. An application role querying explicitly qualified
+extension objects needs `USAGE` on the installation schema and its usual table permissions.
+
+#### EU1 extension and import acceptance
+
+Use an operator-owned project and the existing EU1 node. Set `PGCF_API_URL`,
+`PGCF_INTEGRATOR_API_KEY`, `PGCF_PROJECT_ID`, `PGCF_REGION_ID`, `PGCF_EU1_NODE_ID`,
+`PGCF_SIZE_CLASS_ID` and a unique `PGCF_EXTENSION_RUN_ID` in the process environment. Use
+the management API's exact region ID, such as `eu-dev`, and verify the assigned node.
+
+```sh
+pnpm --filter @pgcf/e2e exec node src/extension-acceptance.ts run
+pnpm --filter @pgcf/e2e exec node src/rls-import-acceptance.ts run
+pnpm --filter @pgcf/e2e exec node src/extension-acceptance.ts run-managed
+```
+
+The extension run verifies activation, queries, constraints, index use and a physical restore for
+`pg_trgm`, `unaccent`, `btree_gist`, `citext`, `pgcrypto` and `ltree`. The RLS run also
+requires `PGCF_RLS_BASELINE_SCRIPT`, the absolute path to the reviewed adopter converter. It runs
+the report-only check and compares the original and converted access decisions through distinct
+restricted database logins. Both runs require patched PostgreSQL 18 on the specified node and
+clean up their disposable databases. Verify separately that the adopter authenticates sessions
+before supplying the claims and that its hosted route uses the scoped runtime role.
+The managed run also requires `PGCF_ADMIN_API_KEY` for its explicit create request. It verifies
+the agent-installed PostGIS and `pg_jsonschema` catalog, spatial index and JSON constraint on the
+source and restored target. Use it after qualifying the managed-extension release on EU1.
+
 ### 2.2 Operations and readiness
 
 `GET /v1/operations/{id}` returns `{id, kind, status, database_id, generation, error, ...}`.
@@ -700,6 +747,31 @@ unplaced), `health` and `storage`:
 
 `null` and `unknown` mean not known, never fine and never zero. These are the very figures the
 operator reads in `GET /v1/operational-health?scope=databases`: one source, two views.
+
+#### Managed PostGIS and JSON Schema validation
+
+The `managed_extensions` field of `POST /v1/databases` accepts a distinct selection of
+`postgis` and `pg_jsonschema` from an administrator. Omit the field for ordinary creation.
+The node installs the selected versions in the `postgres`-owned `pgcf_extensions` schema before
+the first backup and before the creation operation succeeds. Application roles use those
+objects through the schema. They receive `USAGE` there and use their existing table permissions.
+Read the installed version from `pg_extension` after readiness. The API returns the immutable
+selection as `database.managed_extensions`.
+
+The opt-in requires a region whose participating nodes report a current signed release and
+matching OS digests. The operator sets `NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS` only for releases
+qualified with both packaged libraries and a compatible installer. An unset or invalid value
+refuses new opt-ins. Deploy the migration and Worker first with qualification unset. Install the
+signed native release and verify OS convergence before adding that release to qualification.
+The first opt-in raises a permanent release floor for that region, including
+after deletion while backups or cached pages can remain. A same-region physical restore inherits
+the source selection, including a retained source. A move, replacement or cold recovery preserves
+the selection and uses a compatible node. Reassignment to an unqualified release is refused.
+Qualify both current and next releases during a rollout. Keep compatible libraries available for
+all retained data.
+The control database also refuses assignments outside the region's recorded qualified release
+pairs even if an older Worker tries to write one. For Worker rollback, use a version that knows
+the managed extension floor and preserves the desired state and inherited selection on restores.
 
 ### 2.3 Roles, connection URI and passwords
 

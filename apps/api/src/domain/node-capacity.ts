@@ -26,8 +26,10 @@ import { admissionScopesOpenSql } from "./admission-state.ts";
 import { hintDatabases } from "./node-hints.ts";
 import { ApiError } from "../api-error.ts";
 import {
+  combineNativeGuard,
   databaseNeedsExtended,
   extendedNativeGuard,
+  managedExtensionsNativeGuard,
 } from "./native-capabilities.ts";
 import {
   assertResourcesAllowed,
@@ -44,6 +46,7 @@ export async function placePendingDatabases(
   regionId: string,
   limit = 8,
   qualifiedNativeReleases?: string,
+  qualifiedManagedExtensionReleases?: string,
 ): Promise<string[]> {
   RegionId.parse(regionId);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8)
@@ -78,12 +81,22 @@ export async function placePendingDatabases(
     const capabilityEnv = {
       DB: db,
       NATIVE_EXTENDED_RESOURCES_RELEASE_IDS: qualifiedNativeReleases,
+      NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS: qualifiedManagedExtensionReleases,
     };
-    const native = extendedNativeGuard(
-      capabilityEnv,
-      { nodeId: node.id },
-      await databaseNeedsExtended(capabilityEnv, row.id),
-      decidedAt,
+    const native = combineNativeGuard(
+      extendedNativeGuard(
+        capabilityEnv,
+        { nodeId: node.id },
+        await databaseNeedsExtended(capabilityEnv, row.id),
+        decidedAt,
+      ),
+      managedExtensionsNativeGuard(
+        capabilityEnv,
+        { nodeId: node.id },
+        row.managed_extensions_json !== undefined &&
+          row.managed_extensions_json !== "[]",
+        decidedAt,
+      ),
     );
     if (
       !(await db
@@ -185,6 +198,7 @@ export async function runNodeCapacity(
         regionId,
         8,
         env.NATIVE_EXTENDED_RESOURCES_RELEASE_IDS,
+        env.NATIVE_MANAGED_EXTENSIONS_RELEASE_IDS,
       );
   if (placed.length) await hintDatabases(env, placed);
   const result = {

@@ -16,6 +16,7 @@ pub mod hostfiles;
 pub mod layout;
 pub mod link;
 pub mod machine;
+mod managed_extensions;
 #[cfg(target_os = "linux")]
 pub mod mount_holder;
 pub mod node_link;

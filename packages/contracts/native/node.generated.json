@@ -1775,6 +1775,16 @@
               },
               "cold_snapshot_pending": { "type": "boolean" },
               "pg_major": { "type": "number", "const": 18 },
+              "managed_extensions": {
+                "minItems": 1,
+                "maxItems": 2,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": ["pg_jsonschema", "postgis"]
+                },
+                "uniqueItems": true
+              },
               "resources": { "$ref": "#/$defs/DatabaseEffectiveResources" },
               "settings": {
                 "type": "object",

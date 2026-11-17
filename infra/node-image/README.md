@@ -19,6 +19,7 @@ Everything that goes into the image is pinned in [packages.lock.json](packages.l
 | Debian | snapshot.debian.org at `20261117T204736Z` (trixie, trixie-updates, trixie-security) |
 | PGDG | `apt-archive.postgresql.org` `trixie-pgdg-archive`, key [keys/pgdg.asc](keys/pgdg.asc) by sha256 and fingerprint |
 | cloudflared | the `2026.11.1` release `.deb` by URL, size and sha256 |
+| PostgreSQL extensions | PostGIS binary and script packages in the signed PGDG archive, and the upstream PG18 amd64 `pg_jsonschema` release asset by URL, size and sha256 |
 | Packages | every installed `.deb` with name, version, architecture, URL, size and sha256 |
 
 `SOURCE_DATE_EPOCH` is the snapshot time, and [mkosi.conf](mkosi.conf) fixes the repart seed
@@ -26,6 +27,11 @@ Everything that goes into the image is pinned in [packages.lock.json](packages.l
 key and certificate that `ssl-cert` generates at install time are removed with their random hash
 link. Two independent builds of the same lock and definition produce byte-identical raw images, and
 zstd writes the same compressed bytes for any number of threads.
+
+The PostgreSQL server package also supplies `ltree` and the other trusted contrib extensions.
+PostGIS and `pg_jsonschema` require privileged creation in each database. The guest boot test
+checks their installed libraries with a transactional fixture in its scratch database. The
+regional release must supply the same libraries to any node that restores a database using them.
 
 ## Building
 
@@ -40,7 +46,7 @@ node infra/node-image/boot-test.ts --image .local/node-image/out/pgcf-node.raw -
 
 - **resolve** builds once from the snapshot and the PGDG archive with network access, maps every
   installed package to the signed index entry apt verified, and rewrites the `packages` list of the
-  lock. PostgreSQL, pgvector, barman-cli-cloud and `libpq5` are pinned to exact versions in
+  lock. PostgreSQL, pgvector, PostGIS, pg_jsonschema, barman-cli-cloud and `libpq5` are pinned to exact versions in
   `mkosi.conf`, so a new snapshot never moves them silently. `libpq5` needs its own pin: apt takes the
   highest version, and the PGDG archive also holds the release candidates of the next major version
   (it once handed the image `19~rc1`). `validateLock` refuses every locked version that contains
@@ -233,7 +239,7 @@ sha256 its signed page pins.
 | --- | --- | --- | --- |
 | BIOS boot | `pgcf-bios` | 1 MiB | GRUB's BIOS core image |
 | ESP (vfat) | `pgcf-esp` | 512 MiB | GRUB's EFI binary, its modules, `grub/grub.cfg`, `grub/grubenv` |
-| Root (ext4) | `pgcf-root` | built minimal, grown to 8 GiB at first boot | everything, including `/boot` and `/var` |
+| Root (ext4) | `pgcf-root` | built at 2 GiB with the locked spatial dependencies, grown to 8 GiB at first boot | everything, including `/boot` and `/var` |
 | LVM | `pgcf-lvm` | the rest of the disk, added at first boot | the agent's volume group `pgcf` and thin pool |
 
 `systemd-repart` reads [usr/lib/repart.d](mkosi.extra/usr/lib/repart.d) at every boot: on the first

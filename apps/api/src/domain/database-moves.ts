@@ -15,6 +15,8 @@ import {
   combineNativeGuard,
   databaseNeedsExtended,
   extendedNativeGuard,
+  managedExtensionsNativeGuard,
+  type ManagedExtensionsEnv,
 } from "./native-capabilities.ts";
 import type { Env } from "../env.ts";
 import { withAdmissionMutation } from "./admission-mutations.ts";
@@ -138,7 +140,8 @@ const liveNodeSql = `n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM node_losses 
  * placed on the node meanwhile.
  */
 async function targetOpen(
-  env: Pick<Env, "DB" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">,
+  env: Pick<Env, "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS"> &
+    ManagedExtensionsEnv,
   databaseId: string,
   targetNodeId: string,
   now: number,
@@ -146,12 +149,13 @@ async function targetOpen(
   const db = env.DB;
   const need = await db
     .prepare(
-      `SELECT d.region_id,r.memory_mib,r.cpu_millicores,r.storage_mib FROM databases d
+      `SELECT d.region_id,d.managed_extensions_json,r.memory_mib,r.cpu_millicores,r.storage_mib FROM databases d
       JOIN database_resources r ON r.database_id=d.id WHERE d.id=?`,
     )
     .bind(databaseId)
     .first<{
       region_id: string;
+      managed_extensions_json: string;
       memory_mib: number;
       cpu_millicores: number;
       storage_mib: number;
@@ -161,11 +165,19 @@ async function targetOpen(
     (value) => value.id === targetNodeId,
   );
   if (!node || choosePlacement([node], need, now) === null) return null;
-  const native = extendedNativeGuard(
-    env,
-    { nodeId: targetNodeId },
-    await databaseNeedsExtended(env, databaseId),
-    now,
+  const native = combineNativeGuard(
+    extendedNativeGuard(
+      env,
+      { nodeId: targetNodeId },
+      await databaseNeedsExtended(env, databaseId),
+      now,
+    ),
+    managedExtensionsNativeGuard(
+      env,
+      { nodeId: targetNodeId },
+      need.managed_extensions_json !== "[]",
+      now,
+    ),
   );
   if (
     !(await db
@@ -190,7 +202,8 @@ async function targetOpen(
 }
 
 async function targetFits(
-  env: Pick<Env, "DB" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">,
+  env: Pick<Env, "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS"> &
+    ManagedExtensionsEnv,
   databaseId: string,
   targetNodeId: string,
   now: number,
@@ -203,7 +216,8 @@ async function targetFits(
  * move when the same one is already running.
  */
 export async function startDatabaseMove(
-  env: Pick<Env, "DB" | "NODE_ACTOR" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS">,
+  env: Pick<Env, "NODE_ACTOR" | "NATIVE_EXTENDED_RESOURCES_RELEASE_IDS"> &
+    ManagedExtensionsEnv,
   input: { databaseId: string; targetNodeId: string },
   now = Date.now(),
 ): Promise<DatabaseMove> {

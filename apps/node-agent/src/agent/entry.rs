@@ -4,6 +4,7 @@
 use crate::{
     admission,
     archive::{job::Limits as JobLimits, restore::End},
+    managed_extensions::ManagedExtension,
     node_link::constant,
     roles::{self, Wanted},
     state::Resources,
@@ -67,6 +68,7 @@ pub struct Entry {
     /// The effective idle time; `None` is always warm.
     pub sleep_after_seconds: Option<u64>,
     pub roles: Vec<Wanted>,
+    pub(crate) managed_extensions: Vec<ManagedExtension>,
     pub archive_path: String,
     pub credential_id: String,
     pub origin: Option<Origin>,
@@ -173,6 +175,7 @@ impl Entry {
                 seconds => Some(seconds.as_u64()?),
             },
             roles: roles::parse(db["roles"].as_array()?)?,
+            managed_extensions: ManagedExtension::parse(db.get("managed_extensions"))?,
             archive_path: string(&db["archive"], "path")?,
             credential_id: string(&db["archive"]["credential"], "id")?,
             origin,
@@ -265,6 +268,22 @@ mod tests {
     use super::*;
     use crate::link::test_server::{database, vector};
     use serde_json::json;
+
+    #[test]
+    fn desired_entry_preserves_only_distinct_managed_extension_names() {
+        let db = database("dbbbbbbbbbbbbbbbbbbb");
+        let older = Entry::parse(&db).expect("older pages omit the extension list");
+        let mut requested = db.clone();
+        requested["managed_extensions"] = json!(["postgis", "pg_jsonschema"]);
+        assert!(
+            Entry::parse(&requested).expect("the two package names are supported") != older,
+            "the desired entry must retain the extension selection"
+        );
+        requested["managed_extensions"] = json!(["postgis", "postgis"]);
+        assert!(Entry::parse(&requested).is_none());
+        requested["managed_extensions"] = json!(["pgvector"]);
+        assert!(Entry::parse(&requested).is_none());
+    }
 
     #[test]
     fn an_in_place_restore_reads_the_previous_proof_and_keeps_the_database_identity() {

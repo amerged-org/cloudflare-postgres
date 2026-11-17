@@ -17,6 +17,7 @@ import { keyring } from "../crypto/keyring.ts";
 import type { ApiContext, Env } from "../env.ts";
 import {
   effectiveSleepAfterSql,
+  managedExtensionsOf,
   roleMembershipOptions,
   type RoleRow,
 } from "./rows.ts";
@@ -35,6 +36,7 @@ import { openNodeOrders } from "./lifecycle-orders.ts";
 import { openDiagnosticRequests } from "./node-diagnostics.ts";
 import {
   requireExtendedNative,
+  requireManagedExtensionsNative,
   coldStorageNativeGuard,
 } from "./native-capabilities.ts";
 import {
@@ -55,6 +57,7 @@ interface DatabaseRow {
   storage_generation: number;
   archive_path: string;
   pg_major: 18;
+  managed_extensions_json: string;
   route_revision: number;
   memory_mib: number;
   cpu_millicores: number;
@@ -298,7 +301,7 @@ export async function nodeDesiredPage(
   }
   // The databases of the node, and those a move restores onto it from another.
   const result = await env.DB.prepare(
-    `SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,
+    `SELECT d.id,d.generation,d.desired_state,d.suspension_reason,d.storage_generation,d.archive_path,d.pg_major,d.managed_extensions_json,
        COALESCE(ae.route_revision,1) route_revision,dr.memory_mib,dr.cpu_millicores,dr.storage_mib,s.max_connections,
        s.archive_timeout_seconds,${effectiveSleepAfterSql("d")} sleep_after_seconds,
        COALESCE((SELECT c.operation FROM database_cold_storage c WHERE c.operation=d.storage_operation_id AND c.phase IN('activating','succeeded') AND c.target_serving_generation=d.generation),
@@ -339,6 +342,22 @@ export async function nodeDesiredPage(
     .all<DatabaseRow>();
   const rows = result.results.slice(0, query.limit),
     credentials = keyring(env.CREDENTIAL_KEYS);
+  const managedColdWork = await env.DB.prepare(
+    `SELECT 1 FROM database_cold_storage c JOIN databases d ON d.id=c.database_id
+    WHERE d.managed_extensions_json<>'[]' AND
+      (c.verification_node_id=? AND c.phase IN('capturing','verifying','cancelling')
+       OR c.source_node_id=? AND c.phase IN('capturing','cancelling','retiring')) LIMIT 1`,
+  )
+    .bind(node.id, node.id)
+    .first();
+  await requireManagedExtensionsNative(
+    env,
+    { nodeId: node.id },
+    rows.some((row) => row.managed_extensions_json !== "[]") ||
+      managedColdWork !== null,
+    now,
+    true,
+  );
   // The credentials the page names are issued here, a batch for the whole page. A database the
   // node may not hold one for is not on the page.
   const staged = new Map<
@@ -415,6 +434,7 @@ export async function nodeDesiredPage(
               row.create_failed === 0
             ? { kind: "create" as const }
             : undefined;
+    const managedExtensions = managedExtensionsOf(row);
     databases.push({
       id: row.id,
       // A move target serves the generation the move staged; the database row still says the source's.
@@ -428,6 +448,9 @@ export async function nodeDesiredPage(
       route_revision: row.route_revision,
       storage_generation: move?.storage_generation ?? row.storage_generation,
       pg_major: row.pg_major,
+      ...(managedExtensions !== undefined
+        ? { managed_extensions: managedExtensions }
+        : {}),
       // The database's effective values: its own, else its size class's.
       resources: {
         memory_mib: row.memory_mib,
