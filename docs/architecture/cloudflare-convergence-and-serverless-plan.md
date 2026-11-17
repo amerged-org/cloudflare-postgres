@@ -1,3 +1,22 @@
+# Security patches and node image refresh — 2026-11-17
+
+The [security patch implementation plan](2026-11-17-security-patch-plan.md) covers the
+full node image update, audit records for project SQL credential releases and project-scoped
+resource lookups. The three patches are implemented on the candidate branch. Production
+acceptance remains open.
+
+The signed Debian snapshot at `20261117T204736Z` and verified PGDG indexes produced a 220-package
+lock (SHA-256 `a60c791eb526b4aa904b099ebdf58c5cdcd696e55156209702a57261194e2a50`). The refresh
+includes PostgreSQL and client libraries 18.7, pgvector rebuilt against 18.7 headers, Linux
+6.12.117, apt 3.0.4, tzdata 2026f, zlib and cloudflared 2026.11.1. The live-index advisory command
+reported the lock current. All 92 local image and installer checks passed. A real Debian upgrade
+of one retained test data directory from 18.6 to 18.7 preserved two vector values and both tested
+RLS row sets. The kernel change requires a reboot in each region's maintenance cycle.
+
+Seventy-one focused Worker and D1 tests passed, including a generic response on terminal audit
+write failure, a lost D1 acknowledgement retry, role creation and password revision metadata
+from one row, and equal absent-resource responses for project-scoped lookups. The additive
+`0101_credential_disclosures.sql` follows the archive digest migrations.
 # Security hardening release — 2026-11-15
 
 **Deployed to both live nodes; canary accepted on US1 before EU1.** [PR #57](https://github.com/amerged-org/cloudflare-postgres/pull/57)
@@ -2142,7 +2161,7 @@ Changes:
 
 ### 5.8 The path from the Edge to the node
 
-- **cloudflared** 2026.10.0, pinned by sha256. There is one remotely managed Tunnel per node, created by the API at enrollment. Its token is loaded from an encrypted systemd credential, never from a command line.
+- **cloudflared**, pinned by version and sha256 in the [node image lock](../../infra/node-image/packages.lock.json). There is one remotely managed Tunnel per node, created by the API at enrollment. Its token is loaded from an encrypted systemd credential, never from a command line.
 - **The gap today.** The Edge reaches a gateway with a plain fetch to a public HTTPS URL (`apps/edge/src/gateway.ts` L18-45). Anyone on the internet can reach that hostname through Cloudflare and so bypass the Edge's rate limiters and admission. Only the route token protects it.
 - **The fix:** each node's gateway hostname sits behind **Cloudflare Access**.
   - The Edge holds a service token. Access refuses requests without it.
@@ -2246,11 +2265,11 @@ That holds for Rust and for every other language.
 | --- | --- | --- | --- |
 | Debian 13 trixie, kernel 6.12 | Pinned snapshot | DFSG | Node OS |
 | systemd | 257 | LGPL-2.1+ | Units, sandbox, cgroups, credentials, first-boot partitioning |
-| PGDG PostgreSQL | 18.6 | PostgreSQL | Unmodified server, built with systemd support |
+| PGDG PostgreSQL | 18 series, pinned in the node image lock | PostgreSQL | Unmodified server, built with systemd support |
 | pgvector | 0.8.7 | PostgreSQL | Extension |
 | lvm2, thin-provisioning-tools | 2.03.31, 1.1.0 | GPL-2.0 / LGPL | Thin pool and volumes, run as separate tools |
 | barman-cli-cloud | 3.20.1 | GPL-3.0 (separate tool) | WAL archive, base backup, restore, WAL restore |
-| cloudflared | 2026.10.0 | Apache-2.0 | Tunnel |
+| cloudflared | Pinned in the node image lock | Apache-2.0 | Tunnel |
 | mkosi | Pinned tag | LGPL-2.1+ (build tool) | Image build |
 | Rust crates (D-Bus control of systemd, readiness, PostgreSQL client, read-only device-mapper status) | Pinned in `Cargo.lock` | MIT/Apache-2.0, MPL-2.0 | Agent |
 
