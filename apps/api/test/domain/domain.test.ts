@@ -235,14 +235,14 @@ describe("database domain on real Workers D1", () => {
     )
       .bind(id)
       .all<RoleRow>();
-    expect(JSON.stringify(stored.results)).not.toContain(password);
+    expect(JSON.stringify(stored.results).includes(password)).toBe(false);
     const admin = ConnectionUri.parse(
       await (
         await request(`/v1/databases/${id}/roles/app/connection-uri`, f.admin)
       ).json(),
     );
     expect(admin.includes_password).toBe(false);
-    expect(admin.uri).not.toContain(password);
+    expect(admin.uri.includes(password)).toBe(false);
     // A read-only administrator key sees no password either, and so no other administrator key.
     const reader = ApiKeyCreated.parse(
       await (
@@ -261,7 +261,7 @@ describe("database domain on real Workers D1", () => {
       ).json(),
     );
     expect(readerUri.includes_password).toBe(false);
-    expect(readerUri.uri).not.toContain(password);
+    expect(readerUri.uri.includes(password)).toBe(false);
     const integrator = ConnectionUri.parse(
       await (
         await request(
@@ -271,29 +271,71 @@ describe("database domain on real Workers D1", () => {
       ).json(),
     );
     expect(integrator.includes_password).toBe(true);
-    expect(integrator.uri).toContain(password);
+    expect(integrator.uri.includes(password)).toBe(true);
+    const disclosures = await request("/v1/credential-disclosures", f.admin);
+    expect(disclosures.status).toBe(200);
+    const disclosureBody = await disclosures.json<{
+      data: Record<string, unknown>[];
+    }>();
+    expect(JSON.stringify(disclosureBody).includes(password)).toBe(false);
+    expect(disclosureBody.data).toHaveLength(1);
+    expect(disclosureBody.data[0]).toMatchObject({
+      project_id: f.project,
+      database_id: id,
+      role: "app",
+      role_created_at: stored.results[0]?.created_at,
+      password_revision: 1,
+    });
     const desired = await desiredPage(f);
     expect(
-      presentRoles(desired.databases.find((d) => d.id === id)!)[0]?.password,
-    ).toBe(password);
+      presentRoles(desired.databases.find((d) => d.id === id)!)[0]?.password ===
+        password,
+    ).toBe(true);
     const roles = await (
       await request(`/v1/databases/${id}/roles`, f.admin)
     ).json();
-    expect(JSON.stringify(roles)).not.toContain(password);
+    expect(JSON.stringify(roles).includes(password)).toBe(false);
   });
   it("scopes every domain resource to its project", async () => {
     const f = await fixture(),
       body = await created(f),
-      id = body.database.id;
-    const paths = [
-      `/v1/databases/${id}`,
-      `/v1/databases/${id}/roles`,
-      `/v1/databases/${id}/roles/app/connection-uri`,
-      `/v1/databases/${id}/archive`,
+      id = body.database.id,
+      absentId = newDatabaseId();
+    const reader = ApiKeyCreated.parse(
+      await (
+        await request("/v1/api-keys", f.admin, "POST", {
+          name: "domain-reader",
+          scope: "admin_read",
+        })
+      ).json(),
+    );
+    const paths: [string, string][] = [
+      "",
+      "/roles",
+      "/roles/app/connection-uri",
+      "/archive",
+    ].map((suffix) => [
+      `/v1/databases/${id}${suffix}`,
+      `/v1/databases/${absentId}${suffix}`,
+    ]);
+    paths.push([
       `/v1/operations/${body.operation.id}`,
-    ];
-    for (const path of paths)
-      expect((await request(path, f.otherKey)).status).toBe(404);
+      `/v1/operations/${newOperationId()}`,
+    ]);
+    const headers = { "X-Request-Id": crypto.randomUUID() };
+    const foreignRead = (path: string) =>
+      request(path, f.otherKey, "GET", undefined, undefined, headers);
+    for (const [path, absent] of paths) {
+      const foreign = await foreignRead(path);
+      const missing = await foreignRead(absent);
+      expect(foreign.status).toBe(404);
+      expect(missing.status).toBe(404);
+      expect(await foreign.json()).toEqual(await missing.json());
+      expect((await request(path, f.integrator)).status).toBe(200);
+      expect((await request(path, f.admin)).status).toBe(200);
+      expect((await request(path, reader.key)).status).toBe(200);
+      expect((await request(path, "")).status).toBe(401);
+    }
     expect(
       (await request(`/v1/databases/${id}`, f.otherKey, "DELETE")).status,
     ).toBe(404);

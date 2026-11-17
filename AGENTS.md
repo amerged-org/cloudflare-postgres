@@ -4,7 +4,7 @@ Read PLAN.md first; it links to the canonical ULTRA scope, delivery architecture
 Cloudflare is the control plane: Workers, D1, Durable Objects, Workflows, R2, Secrets, Tunnel and Access.
 Only PostgreSQL data lives on VPS; nodes execute Cloudflare's desired state and report observations; a node decides only wake admission, early sleep and recovery starts, from local facts under rules Cloudflare sets, and reports each decision.
 All database traffic enters through Cloudflare (edge Worker, Tunnel); VPS expose no PostgreSQL port.
-Run unmodified PostgreSQL 18.6 under systemd on Debian 13 (trixie): one isolated instance and thin LVM volume per database in a sandboxed slot, with a Rust node agent and gateway. Talos, Kubernetes and CloudNativePG were retired on 2026-10-17; the systemd slot pool was reinstated on October 20.
+Pin unmodified PostgreSQL 18.7 for the Debian 13 (trixie) node image with systemd: one isolated instance and thin LVM volume per database in a sandboxed slot, with a Rust node agent and gateway. Talos, Kubernetes and CloudNativePG were retired on 2026-10-17; the systemd slot pool was reinstated on October 20.
 Back up every database to R2 with Barman Cloud: base backups, WAL archiving, point-in-time recovery.
 Databases sleep when idle and wake on connect; never lose committed data or replay uncertain writes.
 Cloudflare places databases, tracks capacity and adds Contabo VPS through their API under the operator-configured purchase policy.

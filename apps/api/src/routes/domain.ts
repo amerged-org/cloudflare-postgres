@@ -469,6 +469,8 @@ export function registerDomain(app: ApiApp): void {
       path: "/v1/databases/{id}/roles/{name}/connection-uri",
       security,
       tags: ["Roles"],
+      description:
+        "A password-bearing integrator response requires a credential disclosure audit record. An unavailable audit write returns 500. Administrator responses omit the password.",
       request: { params: roleParams },
       responses: responses(ConnectionUri),
     },

@@ -3,7 +3,7 @@
 The canonical scope, delivery architecture, Done/Open status and execution order are in the
 [ULTRA plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md).
 
-Current node stack: **Debian 13 (trixie), systemd, PostgreSQL 18.6, thin LVM and native Rust**.
+The node image pins **Debian 13 (trixie), systemd, PostgreSQL 18.7, thin LVM and native Rust**.
 The image ships `pgcf-agent`, `pgcf-native-gateway`, `pgcf-archive` and `pgcf-wal-fetch`.
 Each database has an isolated PostgreSQL instance and retained volume bound to a sandboxed
 systemd slot. The owner retired Talos, Kubernetes and CloudNativePG on 2026-10-17; the systemd

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import {
+  ApiKeyCreated,
   Database,
   DatabaseWithOperation,
   Operation,
@@ -217,6 +218,14 @@ it("lists the operations of one database newest first with a cursor", async () =
 it("keeps the operations of a deleted database readable", async () => {
   const f = await fixture();
   const { id } = await ready(f);
+  const reader = ApiKeyCreated.parse(
+    await (
+      await request("/v1/api-keys", f.admin, "POST", {
+        name: "operation-reader",
+        scope: "admin_read",
+      })
+    ).json(),
+  );
   const deleted = DatabaseWithOperation.parse(
     await (await request(`/v1/databases/${id}`, f.integrator, "DELETE")).json(),
   );
@@ -228,4 +237,14 @@ it("keeps the operations of a deleted database readable", async () => {
   expect(listed.data.map((operation) => operation.id)).toContain(
     deleted.operation.id,
   );
+  for (const key of [f.integrator, f.admin, reader.key]) {
+    const response = await request(
+      `/v1/operations/${deleted.operation.id}`,
+      key,
+    );
+    expect(response.status).toBe(200);
+    expect(Operation.parse(await response.json()).id).toBe(
+      deleted.operation.id,
+    );
+  }
 });

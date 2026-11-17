@@ -16,9 +16,9 @@ Everything that goes into the image is pinned in [packages.lock.json](packages.l
 | Builder base | `debian:trixie-20260918-slim` by multi-platform digest |
 | Builder tools | Debian packages from the same snapshot as the image |
 | mkosi | tag `v27.1`, fetched by commit and checked |
-| Debian | snapshot.debian.org at `20261022T203737Z` (trixie, trixie-updates, trixie-security) |
+| Debian | snapshot.debian.org at `20261117T204736Z` (trixie, trixie-updates, trixie-security) |
 | PGDG | `apt-archive.postgresql.org` `trixie-pgdg-archive`, key [keys/pgdg.asc](keys/pgdg.asc) by sha256 and fingerprint |
-| cloudflared | the `2026.10.0` release `.deb` by URL, size and sha256 |
+| cloudflared | the `2026.11.1` release `.deb` by URL, size and sha256 |
 | Packages | every installed `.deb` with name, version, architecture, URL, size and sha256 |
 
 `SOURCE_DATE_EPOCH` is the snapshot time, and [mkosi.conf](mkosi.conf) fixes the repart seed

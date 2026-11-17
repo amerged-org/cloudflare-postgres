@@ -42,6 +42,11 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
     "List the audit log of the administrator keys",
     "admin_read",
   ),
+  "GET /v1/credential-disclosures": route(
+    "listCredentialDisclosures",
+    "List authorized SQL credential releases",
+    "admin_read",
+  ),
   "POST /v1/projects": route("createProject", "Create a project", "admin"),
   "GET /v1/projects": route("listProjects", "List accessible projects", "api"),
   "GET /v1/projects/{id}": route("getProject", "Read a project", "project"),

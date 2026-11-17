@@ -74,27 +74,25 @@ async function deletePastRetention(c: ApiContext): Promise<void> {
 export const AUDIT_WRITE_ATTEMPTS = 3;
 const AUDIT_RETRY_PAUSES_MS = [100, 300];
 
-/**
- * Records, before the handler runs, that an administrator key is about to make a request that is
- * not a read. The change cannot be undone once it has happened, so a row that cannot be written
- * refuses the request instead (it fails closed): nothing runs that the log does not know of. A
- * fault of D1 is tried again (`AUDIT_WRITE_ATTEMPTS`); only a row that no attempt could write
- * refuses the request. The outcome is completed by `recordAuditOutcome` once the answer is known.
- */
-export async function auditBeforeChange(
-  c: ApiContext,
-  key: { id: string; scope: AdminScope },
+/** Writes an audit prerequisite. The caller keeps the row ID stable across retries. */
+export async function writeRequiredAuditRow(
+  write: () => Promise<unknown>,
+  phase: "before_change" | "credential_disclosure",
+  errorMessage: string,
 ): Promise<void> {
-  const id = crypto.randomUUID();
   for (let attempt = 1; ; attempt++) {
     try {
-      await insert(c, id, key, null);
-      break;
+      await write();
+      return;
     } catch (error) {
       const failure = {
-        phase: "before_change",
-        error_code: cronErrorCode(error),
-        message: cronErrorMessage(error),
+        phase,
+        ...(phase === "before_change"
+          ? {
+              error_code: cronErrorCode(error),
+              message: cronErrorMessage(error),
+            }
+          : { error_code: "d1_error" }),
       };
       if (attempt < AUDIT_WRITE_ATTEMPTS) {
         console.error(
@@ -112,12 +110,25 @@ export async function auditBeforeChange(
           attempts: attempt,
         }),
       );
-      throw new ApiError(
-        "internal",
-        "The audit log could not be written, so the request was not run",
-      );
+      throw new ApiError("internal", errorMessage);
     }
   }
+}
+
+/**
+ * Records an administrator change before the handler runs. The request can proceed once its
+ * audit row is durable. `recordAuditOutcome` fills in the status after the handler finishes.
+ */
+export async function auditBeforeChange(
+  c: ApiContext,
+  key: { id: string; scope: AdminScope },
+): Promise<void> {
+  const id = crypto.randomUUID();
+  await writeRequiredAuditRow(
+    () => insert(c, id, key, null),
+    "before_change",
+    "The audit log could not be written, so the request was not run",
+  );
   c.set("auditEventId", id);
   await deletePastRetention(c);
 }
