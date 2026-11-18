@@ -673,11 +673,10 @@ mod tests {
 
     #[test]
     fn the_package_architecture_must_be_a_supported_apt_cache_name_part() {
-        let invalid = include_str!("../../../infra/node-image/packages.lock.json").replace(
-            r#""architecture": "amd64""#,
-            r#""architecture": "../amd64""#,
-        );
-        assert!(Lock::parse(invalid.as_bytes()).is_none());
+        let invalid = br#"{"extra":[],"packages":[{"name":"bash","version":"5.2",
+        "architecture":"../amd64","url":"https://snapshot.example/bash.deb",
+        "size":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#;
+        assert!(Lock::parse(invalid).is_none());
     }
 
     #[test]
