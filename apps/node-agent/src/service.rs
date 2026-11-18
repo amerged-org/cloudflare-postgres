@@ -1588,7 +1588,7 @@ impl<M: Machine> Service<M> {
             // by the link before apt sees it.
             let mut files = Vec::new();
             for package in &plan.files {
-                let path = work.join(format!("{}_{}.deb", package.name, package.version));
+                let path = work.join(package.apt_archive_name());
                 self.link
                     .fetch(
                         &package.pinned.url,
@@ -1601,7 +1601,7 @@ impl<M: Machine> Service<M> {
                 files.push(path);
             }
             self.machine
-                .install_packages(&release.debian_snapshot, &files)
+                .install_packages(&release.debian_snapshot, work, &files)
                 .await
                 .map_err(|_| "packages_not_installed")?;
             // Nothing that can fail comes between the install of a kernel and its boot: the order
@@ -5071,7 +5071,7 @@ mod tests {
         let at = |what: &str| calls.iter().position(|call| call.starts_with(what));
         assert!(
             calls.contains(
-                &"install 20261016T000000Z + postgresql-18_18.7-1.deb cloudflared_2026.10.1.deb"
+                &"install 20261016T000000Z + postgresql-18_18.7-1_amd64.deb cloudflared_2026.10.1_amd64.deb"
                     .to_string()
             ),
             "{calls:?}"

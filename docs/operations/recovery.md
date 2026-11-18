@@ -614,6 +614,10 @@ The cycle installs the packages that a release pins (a newer Debian snapshot, a 
 one node and reboots it if needed (plan 9.3). Run it one node at a time, in an announced window,
 with the owner's go for a reboot. Starting a cycle requires an `admin` API key; an `admin_read` key reads its state.
 
+The current agent stages the release's verified `.deb` files under their canonical APT cache
+names in its private maintenance directory. It uses that directory as the archive cache and
+keeps `--no-download` enabled for installation.
+
 1. Register the release (`PUT /v1/fleet/releases/{id}`) and assign it to the node's region
    (`PUT /v1/regions/{id}/release`). Wait until `GET /v1/nodes/{id}/release` says `converged`:
    the node installs the packages with the agent of the release, and the route refuses a node

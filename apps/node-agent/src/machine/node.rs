@@ -711,6 +711,7 @@ impl Machine for Node {
     async fn install_packages(
         &self,
         snapshot: &str,
+        archive_dir: &Path,
         files: &[std::path::PathBuf],
     ) -> io::Result<()> {
         // The node's apt sources name the snapshot of the image; the release names another.
@@ -753,6 +754,12 @@ impl Machine for Node {
         ]
         .map(String::from)
         .into();
+        // Even explicit local .deb arguments must be present in APT's archive cache when
+        // acquisition is disabled. Use only the run's fresh, verified package directory.
+        install.extend([
+            "-o".into(),
+            format!("Dir::Cache::archives={}", archive_dir.display()),
+        ]);
         install.extend(files.iter().map(|file| file.to_string_lossy().into_owned()));
         apt(install).await
     }

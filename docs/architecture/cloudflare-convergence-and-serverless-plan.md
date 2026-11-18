@@ -48,6 +48,15 @@ its previous release `sha-d6a2152015e5` and placement was open. The stored Cloud
 credential was refused by Workers, D1 and R2 with HTTP 401. Registration, rollout and live
 acceptance remain open.
 
+**APT archive cache during EU1 maintenance — 2026-11-18.** The assigned `sha-749bab1b8c87`
+agent reported `packages_not_installed`. An operator readback showed that PostgreSQL 18.6,
+Linux 6.12.113 and the installed package set remained unchanged. The 13 verified release
+archives total 141,594,332 bytes. A read-only APT simulation on EU1 reproduced the failure
+with the default archive cache and `--no-download`. Pointing APT at the directory that held
+those archives under their canonical names selected the same 13 packages and zero removals.
+The agent fix passes its fresh verified download directory as the cache and keeps
+`--no-download` in effect. A subsequent live maintenance result is a separate acceptance.
+
 # Application features proposed — 2026-11-17
 
 The [application feature design and task plans](2026-11-17-postgres-application-features.md)
