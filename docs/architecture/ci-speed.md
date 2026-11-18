@@ -245,6 +245,14 @@ The plan proceeds with the recommended answer unless the owner says otherwise.
 | CI-3 | Skip jobs on pull requests by path, never on a push to main (step 5) | Yes |
 | CI-4 | A larger GitHub-hosted runner (step 6) | Not now; costed go only if steps 1 to 5 miss CI-1 |
 
+### 5.1 TODO: later review of the MacBook CI
+
+The owner decided on 2026-11-18 to keep the CI runners and workflows of this repository unchanged. A later review decides whether the owner's MacBook can serve as CI. It evaluates three questions, and none of them is a change to `ci.yml` today:
+
+- **Public pull request isolation.** The repository is public, so a pull request from a fork must not run its code on the MacBook. The review checks what isolation a self-hosted runner needs for that (which events may reach it, what credentials and local files it can see).
+- **An x64 KVM host for the image test.** The `node-image` job boots the node image in QEMU. The review checks whether the MacBook can provide an x64 host with KVM for that test, or whether the GitHub-hosted runner stays.
+- **The GitHub-hosted OIDC release signer.** The signer accepts only identity tokens with `runner_environment` `github-hosted` (see the ULTRA plan, section 9.3). The review checks that any MacBook runner leaves `sign-release` on a GitHub-hosted runner and does not widen the release-signing trust (2.1).
+
 ## 6. Source
 
 - Owen Gretzinger, "How I made our CI 20x faster (steal this)", 2026-10-30: <https://x.com/owengretzinger/status/2116291924219060319>. The numbers in it are its author's; none of them is used here as ours. Only the levers are.
