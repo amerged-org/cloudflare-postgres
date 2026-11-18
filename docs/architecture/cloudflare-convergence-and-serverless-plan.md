@@ -1,3 +1,42 @@
+# PostgreSQL 18.7 and managed extensions live rollout — 2026-11-18
+
+The `sha-749bab1b8c87` security release from [PR #59](https://github.com/amerged-org/cloudflare-postgres/pull/59)
+first converged on EU1. The 13 verified archives were staged in the APT cache and the
+epoch-prefixed `zlib1g` archive was applied under its canonical filename before final
+convergence. The node then matched the signed package digest and kernel
+`6.12.117+deb13-amd64`. [PR #61](https://github.com/amerged-org/cloudflare-postgres/pull/61)
+implements the verified private-cache fix for subsequent maintenance releases.
+
+The `sha-d72c43f2391f` feature release from [PR #60](https://github.com/amerged-org/cloudflare-postgres/pull/60)
+was registered with signed release spec SHA-256
+`5a691e64cd54b6274523ba3f14dd93dc7a29d0f5217e44c9c42387b054dc96dd`.
+D1 applied `0102_managed_extensions.sql`. The management Worker deployed at 100 percent after
+readback of 54 inherited bindings and all three release qualification bindings. Its module SHA-256
+is `b07353ef57a974f841762dc2bc9c008376ee1e36f4c0b5f53c6065a3b49735dc`.
+
+**EU1 live acceptance.** All database witnesses reached PostgreSQL `180007` through the public SQL
+gateway. The ordinary extension source and its physical restore preserved `btree_gist` 1.8,
+`citext` 1.8, `ltree` 1.3, `pg_trgm` 1.6, `pgcrypto` 1.4 and `unaccent` 1.1. The GIN
+trigram search, expected exclusion and unique violations, backup availability and an explicit
+write on the restored target passed. Three policies and eight access decisions matched between the
+original and converted RLS schemas through independent restricted roles. The #60 managed source
+and physical restore passed the same version and write gates for PostGIS 3.7.0 and
+`pg_jsonschema` 0.3.4, including the spatial index and JSON constraint.
+
+The disposable live board passed signed webhook delivery, viewer isolation, rollback, duplicate
+delivery, membership revocation and idle hibernation while a stream stayed open across two
+heartbeats. The first visible update took **840 ms** from the write request. The idle witness reached
+hibernation in **94,896 ms**, with its sleep marker unchanged across those heartbeats. The hosted
+Worker uses the public Cloudflare fetch route and refuses redirect responses. Readbacks confirmed
+removal of the test Worker, webhook, database and project. The temporary integrator credential then
+returned HTTP 401.
+
+**US1 final maintenance.** After EU1 acceptance, 119 signed archives totaling 209,398,366 bytes
+were staged, then the standard maintenance cycle completed. EU1 and US1 both read back
+`sha-d72c43f2391f`, OS convergence, schedulability and open placement. Their observed package
+digests match the registered package-set digest
+`9d614baf02f7fe860c82affc074305c70e8c3e166fd8a3d734dc0a927d04fa06`.
+
 # Security patches and node image refresh — 2026-11-17
 
 The [security patch implementation plan](2026-11-17-security-patch-plan.md) covers the
