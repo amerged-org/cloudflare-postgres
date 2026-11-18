@@ -1711,11 +1711,12 @@ impl Machine for Local {
         Ok(packages)
     }
 
-    /// Apt's effect on the package list: each file `<name>_<version>.deb` is installed at its
+    /// Apt's effect on the package list: each file `<name>_<version>_<architecture>.deb` installs its
     /// version.
     async fn install_packages(
         &self,
         snapshot: &str,
+        _archive_dir: &Path,
         files: &[std::path::PathBuf],
     ) -> io::Result<()> {
         let mut state = self.state();
@@ -1728,8 +1729,12 @@ impl Machine for Local {
             .push(format!("install {snapshot} + {}", names.join(" ")));
         for name in &names {
             let stem = name.strip_suffix(".deb").unwrap_or(name);
-            if let Some((package, version)) = stem.split_once('_') {
-                state.packages.insert(package.into(), version.into());
+            if let Some((package, suffix)) = stem.split_once('_')
+                && let Some((version, _architecture)) = suffix.rsplit_once('_')
+            {
+                state
+                    .packages
+                    .insert(package.into(), version.replace("%3a", ":"));
             }
         }
         Ok(())

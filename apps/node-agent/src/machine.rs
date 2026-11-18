@@ -426,11 +426,12 @@ pub trait Machine: Send + Sync + 'static {
         &self,
     ) -> impl Future<Output = io::Result<BTreeMap<String, String>>> + Send;
     /// Installs these package files, each already checked against the lock's digest, with apt and
-    /// without asking anything. Apt downloads nothing (`--no-download`): a package that the files
-    /// do not supply is an error, never an install from the archive.
+    /// without asking anything. The private archive directory holds those files under their
+    /// canonical APT cache names. APT downloads nothing (`--no-download`).
     fn install_packages(
         &self,
         snapshot: &str,
+        archive_dir: &Path,
         files: &[PathBuf],
     ) -> impl Future<Output = io::Result<()>> + Send;
     /// Purges these packages (`update::purgeable`) with dpkg, which refuses one that an installed

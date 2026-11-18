@@ -367,7 +367,20 @@ fn prune(bin: &Path, keep: &str, previous: Option<&Path>) {
 pub struct Package {
     pub name: String,
     pub version: String,
+    pub architecture: String,
     pub pinned: Pinned,
+}
+
+impl Package {
+    /// APT looks for the local archive under its standard cache name in no-download mode.
+    pub fn apt_archive_name(&self) -> String {
+        format!(
+            "{}_{}_{}.deb",
+            self.name,
+            self.version.replace(':', "%3a"),
+            self.architecture
+        )
+    }
 }
 
 /// The image's `packages.lock.json`: the packages apt installs from the snapshot, and the extra
@@ -391,9 +404,13 @@ impl Lock {
                     let version = entry["version"]
                         .as_str()
                         .filter(|version| is_version(version))?;
+                    let architecture = entry["architecture"]
+                        .as_str()
+                        .filter(|value| matches!(*value, "amd64" | "all"))?;
                     Some(Package {
                         name: name.to_string(),
                         version: version.to_string(),
+                        architecture: architecture.to_string(),
                         pinned: Pinned {
                             url: entry["url"].as_str()?.to_string(),
                             sha256: entry["sha256"].as_str()?.to_string(),
@@ -589,6 +606,7 @@ mod tests {
         let package = |name: &str, version: &str| Package {
             name: name.into(),
             version: version.into(),
+            architecture: "amd64".into(),
             pinned: Pinned {
                 url: format!("https://snapshot.example/{name}_{version}.deb"),
                 sha256: "a".repeat(64),
@@ -648,13 +666,22 @@ mod tests {
         .unwrap();
         assert_eq!(lock.extra[0].pinned.size_bytes, 19_316_284);
         assert_eq!(lock.packages[0].name, "adduser");
+        assert_eq!(lock.packages[0].apt_archive_name(), "adduser_3.152_all.deb");
         assert_eq!(Lock::parse(b"{}"), None);
         assert_eq!(Lock::parse(b"not json"), None);
     }
 
     #[test]
+    fn the_package_architecture_must_be_a_supported_apt_cache_name_part() {
+        let invalid = br#"{"extra":[],"packages":[{"name":"bash","version":"5.2",
+        "architecture":"../amd64","url":"https://snapshot.example/bash.deb",
+        "size":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#;
+        assert!(Lock::parse(invalid).is_none());
+    }
+
+    #[test]
     fn a_lock_entry_whose_name_or_version_is_no_file_name_part_is_refused() {
-        // Each package becomes a file `<name>_<version>.deb` under the agent's directory, so a name
+        // Each package becomes a file `<name>_<version>_<architecture>.deb` in the cache, so a name
         // or a version that could leave it (a slash, a dot-dot name) is no lock at all.
         let entry = |name: &str, version: &str| {
             format!(
@@ -664,6 +691,13 @@ mod tests {
         };
         assert!(Lock::parse(entry("adduser", "3.152").as_bytes()).is_some());
         assert!(Lock::parse(entry("adduser", "3.152+b1~deb13:1").as_bytes()).is_some());
+        assert_eq!(
+            Lock::parse(entry("zlib1g", "1:1.3.1").as_bytes())
+                .unwrap()
+                .packages[0]
+                .apt_archive_name(),
+            "zlib1g_1%3a1.3.1_all.deb"
+        );
         assert_eq!(
             Lock::parse(entry("adduser", "1.0/../../x").as_bytes()),
             None
