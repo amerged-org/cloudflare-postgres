@@ -1,6 +1,7 @@
 # cloudflare-postgres
 Open-source, Neon-style serverless PostgreSQL: Cloudflare control plane, real PostgreSQL on Contabo VPS.
 Read PLAN.md first; it links to the canonical ULTRA scope, delivery architecture and Done/Open status.
+An agent that integrates or calls pgcf, or that sees a pgcf error, starts at llms.txt and docs/errors.md instead of PLAN.md.
 Cloudflare is the control plane: Workers, D1, Durable Objects, Workflows, R2, Secrets, Tunnel and Access.
 Only PostgreSQL data lives on VPS; nodes execute Cloudflare's desired state and report observations; a node decides only wake admission, early sleep and recovery starts, from local facts under rules Cloudflare sets, and reports each decision.
 All database traffic enters through Cloudflare (edge Worker, Tunnel); VPS expose no PostgreSQL port.
