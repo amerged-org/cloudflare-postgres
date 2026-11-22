@@ -1,0 +1,17 @@
+# cloudflare-postgres (pgcf)
+
+> Open-source serverless PostgreSQL. A Cloudflare control plane (API Worker, Edge Worker, Durable Objects) places real PostgreSQL 18 on your own VPS nodes. Databases sleep when idle and wake on connect. Used by ohmyho.st.
+
+Start here when you integrate pgcf or when you see a pgcf error.
+
+- [Errors](https://github.com/amerged-org/cloudflare-postgres/blob/main/docs/errors.md): every API error code, `details.reason`, validation field list and connection refusal with cause, fix and whether a retry helps. Read this first for any error.
+- [Integrator handover](https://github.com/amerged-org/cloudflare-postgres/blob/main/docs/operations/integrator-handover.md): the REST API, connecting, limits, metering, recovery. Long; use its table of contents. Appendix A is the error reference.
+- [README](https://github.com/amerged-org/cloudflare-postgres/blob/main/README.md): stack, architecture and the TypeScript client (`PgcfClient`).
+- [Operator installation](https://github.com/amerged-org/cloudflare-postgres/blob/main/docs/operations/operator-installation.md): self-hosting. Only for the operator of an installation.
+
+Facts that answer most questions:
+
+- REST under `/v1`, `Authorization: Bearer <key>`; `GET /v1/openapi.json` is the contract. Mutations need an `Idempotency-Key`.
+- An error body is `{"error": {"code", "message", "request_id", "details"?}}`; `details.reason` is the stable cause, `details.fields` lists each field a validation refused, `Retry-After` says when a retry can help.
+- A database connection refusal is a PostgreSQL error; its message ends with `(pgcf: <reason>)` where the Edge decided it. A wrong password, an unknown role and an unknown database are one `28P01` answer by design.
+- `pgcf connect --endpoint wss://<host> --database <id> --user <role>` opens a local loopback port for psql and migration tools.

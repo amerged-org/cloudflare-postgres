@@ -18,7 +18,13 @@ import {
   listEnvelope,
 } from "./api.ts";
 import { ApiKeyString } from "./auth.ts";
-import { ErrorBody, type ErrorCode } from "./errors.ts";
+import {
+  ErrorBody,
+  retryAfterSeconds,
+  type ErrorCode,
+  type ErrorField,
+  type ErrorReason,
+} from "./errors.ts";
 import { DatabaseId, NodeId, OperationId, RoleName } from "./ids.ts";
 import {
   NodeAddition,
@@ -36,20 +42,43 @@ export type PgcfClientErrorCode =
   | "redirect_refused"
   | "invalid_response";
 
+/** What the API said about a refusal, kept so that a caller learns the cause and the fix. */
+export interface PgcfClientErrorDetail {
+  /** The API's explanation, with the API key redacted if a misbehaving server echoed it. */
+  message?: string;
+  /** The stable cause of a refusal that one code stands for several of. */
+  reason?: ErrorReason | null;
+  /** Seconds to wait before repeating, from `Retry-After` or the code and reason; null when repeating cannot help. */
+  retryAfterSeconds?: number | null;
+  /** Each field a validation refused. */
+  fields?: readonly ErrorField[];
+}
+
 export class PgcfClientError extends Error {
   readonly code: PgcfClientErrorCode;
   readonly status: number | null;
   readonly requestId: string | null;
+  readonly reason: ErrorReason | null;
+  readonly retryAfterSeconds: number | null;
+  readonly fields: readonly ErrorField[];
   constructor(
     code: PgcfClientErrorCode,
     status: number | null = null,
     requestId: string | null = null,
+    detail: PgcfClientErrorDetail = {},
   ) {
-    super(`PGCF request failed: ${code}`);
+    super(
+      detail.message
+        ? `PGCF request failed: ${code}: ${detail.message}`
+        : `PGCF request failed: ${code}`,
+    );
     this.name = "PgcfClientError";
     this.code = code;
     this.status = status;
     this.requestId = requestId;
+    this.reason = detail.reason ?? null;
+    this.retryAfterSeconds = detail.retryAfterSeconds ?? null;
+    this.fields = detail.fields ?? [];
   }
 }
 
@@ -207,11 +236,27 @@ export class PgcfClient {
         const parsed = ErrorBody.safeParse(value);
         if (!parsed.success)
           throw new PgcfClientError("invalid_response", response.status);
+        const { code, message, details } = parsed.data.error;
         const id = z.uuid().safeParse(parsed.data.error.request_id);
+        const header = response.headers.get("Retry-After");
+        // Only whole seconds: a date or any other text of the header is not advice a caller can use.
+        const advised =
+          header !== null && /^[0-9]{1,6}$/.test(header)
+            ? Number(header)
+            : retryAfterSeconds(code, details?.reason);
         throw new PgcfClientError(
-          parsed.data.error.code,
+          code,
           response.status,
           id.success ? id.data : null,
+          {
+            message: message.replaceAll(this.#apiKey, "[redacted]"),
+            reason: details?.reason ?? null,
+            retryAfterSeconds: advised ?? null,
+            fields: (details?.fields ?? []).map((field) => ({
+              path: field.path.replaceAll(this.#apiKey, "[redacted]"),
+              expected: field.expected.replaceAll(this.#apiKey, "[redacted]"),
+            })),
+          },
         );
       }
       const parsed = schema.safeParse(value);

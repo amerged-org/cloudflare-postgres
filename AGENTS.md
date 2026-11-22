@@ -1,6 +1,7 @@
 # cloudflare-postgres
 Open-source, Neon-style serverless PostgreSQL: Cloudflare control plane, real PostgreSQL on Contabo VPS.
 Read PLAN.md first; it links to the canonical ULTRA scope, delivery architecture and Done/Open status.
+An agent that integrates or calls pgcf, or that sees a pgcf error, starts at llms.txt and docs/errors.md instead of PLAN.md.
 Cloudflare is the control plane: Workers, D1, Durable Objects, Workflows, R2, Secrets, Tunnel and Access.
 Only PostgreSQL data lives on VPS; nodes execute Cloudflare's desired state and report observations; a node decides only wake admission, early sleep and recovery starts, from local facts under rules Cloudflare sets, and reports each decision.
 All database traffic enters through Cloudflare (edge Worker, Tunnel); VPS expose no PostgreSQL port.
@@ -20,7 +21,7 @@ At native CLI boundaries, materialize filename-flag payloads as real 0600 files 
 Record completed steps and measured numbers in the ULTRA plan linked by PLAN.md; no per-change evidence documents.
 Never give effort or duration estimates (weeks, days, hours or any other unit) for planned work, in plans, designs, reports or replies.
 Repository documentation is written in English; discussion with the owner may be in German.
-Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra and app READMEs, docs/operations runbooks and docs/architecture proposals.
+Docs live in PLAN.md, README.md, llms.txt, docs/errors.md (generated from the error code lists; regenerate as test/error-guide.test.ts says), THIRD_PARTY.md, infra and app READMEs, docs/operations runbooks and docs/architecture proposals.
 Deployed first-party node binaries are native Rust: pgcf-agent, pgcf-native-gateway, pgcf-archive and pgcf-wal-fetch. PostgreSQL, Barman Cloud, cloudflared and OS packages retain their upstream implementations; the node image requires no Node.js runtime.
 TypeScript remains deployed for the management API, Durable Objects, Workflows and Edge Worker; the CLI and operator scripts remain on Node.js. Rust/Wasm Edge is built/tested but not deployed and remains the approved target under open decision D12.
 Shared zod contracts remain authoritative initially; Rust consumers use generated schemas/constants and behavioral conformance tests.

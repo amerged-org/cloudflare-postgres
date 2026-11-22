@@ -13,6 +13,11 @@
  * The password of the connection string goes to the gateway in the request body only; it is
  * never logged, and neither are statements or parameters.
  */
+import {
+  CONNECTION_REFUSALS,
+  refusalMessage,
+  type ConnectionRefusalReason,
+} from "@pgcf/contracts/connection-refusals";
 import { refusalCode } from "@pgcf/contracts/edge-policy";
 import {
   MAX_SQL_REQUEST_BYTES,
@@ -63,6 +68,14 @@ interface Timings extends AdmissionTimings {
 
 /** HTTP requests count in buckets of their own, so queries never take WebSocket handshakes. */
 const SCOPE = ["sql"] as const;
+
+/** A refusal of the HTTP answer with its closed reason; see `CONNECTION_REFUSALS`. */
+function refused(reason: ConnectionRefusalReason): SqlFailure {
+  return new SqlFailure(
+    CONNECTION_REFUSALS[reason].sqlstate,
+    refusalMessage(reason),
+  );
+}
 
 /** An admission's refusal as the HTTP answer: a decoy is a refused password. */
 function refusedAs(error: unknown): never {
@@ -127,7 +140,7 @@ async function forward(
     url.username ||
     url.password
   )
-    throw new SqlFailure("08006", "gateway connection failed");
+    throw refused("gateway_unavailable");
   url.pathname = "/sql";
   let send: (request: Request) => Promise<Response> = (request) =>
     fetch(request);
@@ -140,7 +153,7 @@ async function forward(
       !("fetch" in binding) ||
       typeof binding.fetch !== "function"
     )
-      throw new SqlFailure("08006", "gateway connection failed");
+      throw refused("gateway_unavailable");
     send = (request) => (binding as Fetcher).fetch(request);
   }
   // Built before the send: a request that cannot be built was never sent, so it is no unknown
@@ -160,7 +173,7 @@ async function forward(
     });
   } catch (error) {
     if (error instanceof GatewayConfigError) timings.config_error = error.code;
-    throw new SqlFailure("08006", "gateway connection failed");
+    throw refused("gateway_unavailable");
   }
   const started = Date.now();
   let response: Response;
@@ -219,8 +232,7 @@ export async function serveSql(
   let region: string | null = null;
   let outcome = "accepted";
   try {
-    if (request.method !== "POST")
-      throw new SqlFailure("08P01", "HTTP SQL requires POST");
+    if (request.method !== "POST") throw refused("method_not_allowed");
     const routed = (target = connection(request.headers));
     const characteristics = transaction(request.headers);
     // Before the body is read, parsed or validated: a limited client is refused as it arrives.
@@ -262,9 +274,7 @@ export async function serveSql(
     );
   } catch (error) {
     const failure =
-      error instanceof SqlFailure
-        ? error
-        : new SqlFailure("08006", "gateway connection failed");
+      error instanceof SqlFailure ? error : refused("gateway_unavailable");
     outcome = failure.code;
     return json(
       {

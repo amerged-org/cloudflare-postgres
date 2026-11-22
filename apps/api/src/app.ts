@@ -6,7 +6,9 @@ import {
   errorBody,
   retryAfterSeconds,
   type ErrorCode,
+  ERROR_FIELDS_MAX,
   type ErrorDetails,
+  type ErrorField,
 } from "@pgcf/contracts";
 import { HTTPException } from "hono/http-exception";
 import { routePath } from "hono/route";
@@ -239,11 +241,36 @@ function httpError(error: HTTPException): { code: ErrorCode; message: string } {
   }
 }
 
+/**
+ * Each field a validation refused: its path and what the schema expects of it. A schema's message
+ * states the expectation and never the received value; an unknown key is named so that the caller
+ * can remove it.
+ */
+function validationFields(issues: readonly z.core.$ZodIssue[]): ErrorField[] {
+  const fields: ErrorField[] = [];
+  for (const issue of issues) {
+    const path = issue.path.map(String);
+    if (issue.code === "unrecognized_keys")
+      for (const key of issue.keys)
+        fields.push({
+          path: [...path, key].join("."),
+          expected: "no such field",
+        });
+    else fields.push({ path: path.join("."), expected: issue.message });
+  }
+  return fields.slice(0, ERROR_FIELDS_MAX).map(({ path, expected }) => ({
+    path: path.slice(0, 256),
+    expected: expected.slice(0, 256),
+  }));
+}
+
 export function createApp(): ApiApp {
   const app = new OpenAPIHono<ApiEnv>({
     defaultHook(result, c) {
       if (!result.success)
-        return apiError(c, "invalid_request", "Request validation failed");
+        return apiError(c, "invalid_request", "Request validation failed", {
+          fields: validationFields(result.error.issues),
+        });
     },
   });
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: Apache-2.0
 import { startBridge } from "./bridge.ts";
+import { describeFailure } from "./errors.ts";
 import { instructions, parseArgs } from "./options.ts";
 
 const HELP =
@@ -28,10 +29,6 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 }
 
 main().catch((error: unknown) => {
-  const code =
-    error instanceof Error && /^[a-z][a-z0-9_]{0,50}$/.test(error.message)
-      ? error.message
-      : "connect_failed";
-  process.stderr.write(`pgcf: ${code}\n`);
+  process.stderr.write(describeFailure(error));
   process.exitCode = 1;
 });

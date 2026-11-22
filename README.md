@@ -219,8 +219,10 @@ const restored = await client.restoreDatabase(sourceId,
 ```
 
 Keep `logicalOperationKey` stable for retries of that management operation. The client does not
-retry uncertain writes or expose server response bodies in errors. PostgreSQL client pooling
-remains the integrator's responsibility.
+retry uncertain writes or expose server response bodies in errors: a `PgcfClientError` carries the
+code, status, request ID, the API's message, `reason`, `retryAfterSeconds` and each failing field
+(see [errors](docs/errors.md)), never the body or the key. PostgreSQL client pooling remains the
+integrator's responsibility.
 
 ### Optional infrastructure notifications
 
