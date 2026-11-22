@@ -555,7 +555,7 @@ it("rejects and cancels oversized streamed responses without returning their bod
   expect(fetcher).toHaveBeenCalledTimes(1);
 });
 
-it("returns only API error code, status and a safe request ID", async () => {
+it("returns only API error code, status, a safe request ID and the redacted explanation", async () => {
   const f = fixtures(),
     requestId = crypto.randomUUID();
   const fetcher = vi
@@ -587,6 +587,7 @@ it("returns only API error code, status and a safe request ID", async () => {
     .catch((value: unknown) => value);
   expect(error).toMatchObject({ code: "conflict", status: 409, requestId });
   expect(JSON.stringify(error)).not.toContain(f.apiKey);
+  expect((error as Error).message).not.toContain(f.apiKey);
   const unsafeId = await client
     .getDatabase(f.database.id)
     .catch((value: unknown) => value);
@@ -596,6 +597,67 @@ it("returns only API error code, status and a safe request ID", async () => {
     requestId: null,
   });
   expect(JSON.stringify(unsafeId)).not.toContain(f.apiKey);
+});
+
+it("keeps the message, reason, retry advice and failing fields of an API error", async () => {
+  const f = fixtures(),
+    requestId = crypto.randomUUID();
+  const fetcher = vi
+    .fn<typeof fetch>()
+    .mockResolvedValueOnce(
+      Response.json(
+        {
+          error: {
+            code: "conflict",
+            message: "Database configuration is not ready",
+            request_id: requestId,
+            details: { reason: "not_ready", credential: f.apiKey },
+          },
+        },
+        { status: 409, headers: { "Retry-After": "5" } },
+      ),
+    )
+    .mockResolvedValueOnce(
+      Response.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: `Request validation failed for ${f.apiKey}`,
+            request_id: requestId,
+            details: {
+              fields: [
+                { path: "name", expected: "string, at most 63 characters" },
+              ],
+            },
+          },
+        },
+        { status: 400 },
+      ),
+    );
+  const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
+  const refused = await client
+    .getDatabase(f.database.id)
+    .catch((value: unknown) => value as PgcfClientError);
+  expect(refused).toMatchObject({
+    code: "conflict",
+    reason: "not_ready",
+    retryAfterSeconds: 5,
+    fields: [],
+  });
+  expect((refused as Error).message).toBe(
+    "PGCF request failed: conflict: Database configuration is not ready",
+  );
+  const invalid = await client
+    .getDatabase(f.database.id)
+    .catch((value: unknown) => value as PgcfClientError);
+  expect(invalid).toMatchObject({
+    code: "invalid_request",
+    reason: null,
+    retryAfterSeconds: null,
+    fields: [{ path: "name", expected: "string, at most 63 characters" }],
+  });
+  expect(JSON.stringify(invalid)).not.toContain(f.apiKey);
+  expect((invalid as Error).message).not.toContain(f.apiKey);
 });
 
 it("refuses redirects without following them or exposing their locations", async () => {

@@ -88,9 +88,25 @@ export const ErrorReason = z.enum(ERROR_REASONS).meta({
 });
 export type ErrorReason = z.infer<typeof ErrorReason>;
 
-/** `reason` is the stable cause; any other key is context of the one route that sets it. */
+/** One field a request validation refused: where it is in the request and what it must be. */
+export const ErrorField = z
+  .strictObject({
+    path: z.string().max(256),
+    expected: z.string().max(256),
+  })
+  .meta({ id: "ErrorField" });
+export type ErrorField = z.infer<typeof ErrorField>;
+export const ERROR_FIELDS_MAX = 20;
+
+/**
+ * `reason` is the stable cause; `fields` names each field a validation refused (an `invalid_request`
+ * of a malformed body, query or path); any other key is context of the one route that sets it.
+ */
 export const ErrorDetails = z
-  .looseObject({ reason: ErrorReason.optional() })
+  .looseObject({
+    reason: ErrorReason.optional(),
+    fields: z.array(ErrorField).max(ERROR_FIELDS_MAX).optional(),
+  })
   .meta({ id: "ErrorDetails" });
 export type ErrorDetails = z.infer<typeof ErrorDetails>;
 

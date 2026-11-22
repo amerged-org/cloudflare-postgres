@@ -152,6 +152,31 @@ describe("API harness in the Workers runtime", () => {
     expect(body.error.request_id).toBe(response.headers.get("X-Request-Id"));
   });
 
+  it("names each field a validation refused without echoing its value", async () => {
+    const app = projectApp();
+    const secret = `secret-${crypto.randomUUID()}`;
+    const response = await app.fetch(
+      request("/test/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: 5, extra: secret }),
+      }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    const body = ErrorBody.parse(await response.json());
+    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.details?.fields).toContainEqual({
+      path: "name",
+      expected: expect.stringContaining("expected string"),
+    });
+    expect(body.error.details?.fields).toContainEqual({
+      path: "extra",
+      expected: "no such field",
+    });
+    expect(JSON.stringify(body)).not.toContain(secret);
+  });
+
   it("bounds streamed bodies even when Content-Length is absent", async () => {
     const app = projectApp();
     let cancelled = false;
