@@ -29,7 +29,7 @@ test("CLI help and invalid flags reveal no supplied credential text", async () =
   const [code] = await once(child, "close");
   assert.equal(code, 1);
   assert.equal(output.includes(secret), false);
-  assert.match(output, /invalid_arguments/);
+  assert.match(output, /^pgcf: invalid_arguments: use only --endpoint/);
 });
 
 async function stopped(signal: "SIGINT" | "SIGTERM") {
