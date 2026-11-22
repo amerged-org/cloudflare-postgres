@@ -21,7 +21,7 @@ At native CLI boundaries, materialize filename-flag payloads as real 0600 files 
 Record completed steps and measured numbers in the ULTRA plan linked by PLAN.md; no per-change evidence documents.
 Never give effort or duration estimates (weeks, days, hours or any other unit) for planned work, in plans, designs, reports or replies.
 Repository documentation is written in English; discussion with the owner may be in German.
-Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra and app READMEs, docs/operations runbooks and docs/architecture proposals.
+Docs live in PLAN.md, README.md, llms.txt, docs/errors.md (generated from the error code lists; regenerate as test/error-guide.test.ts says), THIRD_PARTY.md, infra and app READMEs, docs/operations runbooks and docs/architecture proposals.
 Deployed first-party node binaries are native Rust: pgcf-agent, pgcf-native-gateway, pgcf-archive and pgcf-wal-fetch. PostgreSQL, Barman Cloud, cloudflared and OS packages retain their upstream implementations; the node image requires no Node.js runtime.
 TypeScript remains deployed for the management API, Durable Objects, Workflows and Edge Worker; the CLI and operator scripts remain on Node.js. Rust/Wasm Edge is built/tested but not deployed and remains the approved target under open decision D12.
 Shared zod contracts remain authoritative initially; Rust consumers use generated schemas/constants and behavioral conformance tests.
