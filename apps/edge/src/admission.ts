@@ -13,6 +13,11 @@ import {
   signNodeRouteToken,
   signWakeRouteToken,
 } from "@pgcf/contracts/route-token-core";
+import {
+  CONNECTION_REFUSALS,
+  refusalMessage,
+  type ConnectionRefusalReason,
+} from "@pgcf/contracts/connection-refusals";
 import type { DatabaseWakeAdmission, Env } from "./env.ts";
 import type { GatewayRegion } from "./gateway.ts";
 import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
@@ -74,6 +79,18 @@ export class AdmissionFailure extends Error {
   }
 }
 
+/** A refusal with its closed reason appended to the message; see `CONNECTION_REFUSALS`. */
+export function refusal(
+  reason: ConnectionRefusalReason,
+  decoy = false,
+): AdmissionFailure {
+  return new AdmissionFailure(
+    CONNECTION_REFUSALS[reason].sqlstate,
+    refusalMessage(reason),
+    decoy,
+  );
+}
+
 /** The DatabaseActor, got at the location hint the API creates it at; an existing one never moves. */
 export function databaseActor(env: Env, database: string) {
   const hint = env.DATABASE_ACTOR_LOCATION_HINT;
@@ -83,7 +100,11 @@ export function databaseActor(env: Env, database: string) {
   );
 }
 
-type Limit = readonly [limiter: RateLimit, key: string, refusal: string];
+type Limit = readonly [
+  limiter: RateLimit,
+  key: string,
+  refusal: ConnectionRefusalReason,
+];
 
 /**
  * The limiters a request counts in, keyed by what is known before any body: the database and role
@@ -97,29 +118,22 @@ function routeLimits(
   scope: readonly string[],
 ): Limit[] {
   const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
-  if (network === null)
-    throw new AdmissionFailure("53300", "connection rate limit exceeded");
+  if (network === null) throw refusal("rate_limited");
   // Shared proxy networks must not couple unrelated database/role routes.
   // These untrusted hints scope admission; PostgreSQL authenticates the user.
   const key = JSON.stringify([...scope, hints.database, hints.user, network]);
   // A same-account Worker on a service binding has a budget of its own per database and role; it
   // never drains, or is drained by, the public buckets.
   return network === "binding"
-    ? [
-        [
-          env.BINDING_CONNECTION_RATE_LIMITER,
-          key,
-          "connection rate limit exceeded",
-        ],
-      ]
+    ? [[env.BINDING_CONNECTION_RATE_LIMITER, key, "rate_limited"]]
     : [
-        [env.CONNECTION_RATE_LIMITER, key, "connection rate limit exceeded"],
+        [env.CONNECTION_RATE_LIMITER, key, "rate_limited"],
         [
           env.DATABASE_CONNECTION_RATE_LIMITER,
           scope.length === 0
             ? hints.database
             : JSON.stringify([...scope, hints.database]),
-          "database connection rate limit exceeded",
+          "database_rate_limited",
         ],
       ];
 }
@@ -153,9 +167,7 @@ async function limitSource(
 ): Promise<void> {
   const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
   if (network === null || network === "binding") return;
-  const limits: Limit[] = [
-    [env.SOURCE_RATE_LIMITER, network, "connection rate limit exceeded"],
-  ];
+  const limits: Limit[] = [[env.SOURCE_RATE_LIMITER, network, "rate_limited"]];
   const outcomes = await Promise.allSettled(
     countLimits(limits, timings, Date.now()),
   );
@@ -168,13 +180,13 @@ function refuseLimited(
   outcomes: PromiseSettledResult<RateLimitOutcome>[],
 ): void {
   if (outcomes.some((outcome) => outcome.status === "rejected"))
-    throw new AdmissionFailure("53300", "connection admission unavailable");
-  for (const [index, [, , message]] of limits.entries())
+    throw refusal("admission_unavailable");
+  for (const [index, [, , reason]] of limits.entries())
     if (
       !(outcomes[index] as PromiseFulfilledResult<RateLimitOutcome>).value
         .success
     )
-      throw new AdmissionFailure("53300", message);
+      throw refusal(reason);
 }
 
 /**
@@ -190,8 +202,7 @@ export async function limitRoute(
   scope: readonly string[],
 ): Promise<void> {
   const check = () => {
-    if (request.signal.aborted)
-      throw new AdmissionFailure("08006", "connection admission interrupted");
+    if (request.signal.aborted) throw refusal("admission_interrupted");
   };
   check();
   await limitSource(request, env, timings);
@@ -220,8 +231,7 @@ export async function admitRoute(
   counted = false,
 ): Promise<{ region: GatewayRegion; token: string }> {
   const check = () => {
-    if (signal.aborted)
-      throw new AdmissionFailure("08006", "connection admission interrupted");
+    if (signal.aborted) throw refusal("admission_interrupted");
   };
   check();
   // A request that `limitRoute` counted has passed the limiters already; any other request is
@@ -272,18 +282,12 @@ export async function admitRoute(
           true,
         );
       case "57P03":
-        throw new AdmissionFailure(
-          "57P03",
-          "database is not accepting connections",
-        );
+        throw refusal("database_not_accepting");
       case "53300":
-        throw new AdmissionFailure(
-          "53300",
-          "database connection rate limit exceeded",
-        );
+        throw refusal("database_rate_limited");
       default:
         timings.admit_error = "actor_failure";
-        throw new AdmissionFailure("08006", "gateway connection failed");
+        throw refusal("gateway_unavailable");
     }
   }
   const region = admitted.region;
@@ -331,10 +335,7 @@ export async function bounded<T>(
 ): Promise<T> {
   const deadline = Date.now() + ADMISSION_DEADLINE_MS;
   const controller = new AbortController();
-  const abort = () =>
-    controller.abort(
-      new AdmissionFailure("08006", "connection admission interrupted"),
-    );
+  const abort = () => controller.abort(refusal("admission_interrupted"));
   request.signal.addEventListener("abort", abort, { once: true });
   if (request.signal.aborted) abort();
   let refuse!: () => void;
@@ -347,8 +348,8 @@ export async function bounded<T>(
     () => {
       controller.abort(
         gatewayStarted()
-          ? new AdmissionFailure("08006", "connection admission interrupted")
-          : new AdmissionFailure("57P03", "database is not ready yet"),
+          ? refusal("admission_interrupted")
+          : refusal("wake_deadline"),
       );
     },
     Math.max(0, deadline - Date.now()),

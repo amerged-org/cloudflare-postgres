@@ -11,6 +11,7 @@
     "./timestamp": "./src/timestamp.ts",
     "./database-admission": "./src/database-admission.ts",
     "./edge-policy": "./src/edge-policy.ts",
+    "./connection-refusals": "./src/connection-refusals.ts",
     "./edge-sql": "./src/edge-sql.ts",
     "./usage": "./src/usage.ts",
     "./execution-usage": "./src/execution-usage.ts",

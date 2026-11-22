@@ -6,6 +6,7 @@ import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import {
   AdmissionFailure,
   admitRoute,
+  refusal,
   bounded,
   edgeShare,
   nextIsolateRequest,
@@ -35,12 +36,11 @@ interface Timings extends AdmissionTimings {
 function routingHints(url: URL): Hints {
   const databases = url.searchParams.getAll("database");
   const users = url.searchParams.getAll("user");
-  if (databases.length > 1 || users.length > 1)
-    throw new AdmissionFailure("08P01", "duplicate connection admission hint");
+  if (databases.length > 1 || users.length > 1) throw refusal("duplicate_hint");
   if (databases.length !== 1 || !isDatabaseId(databases[0]))
-    throw new AdmissionFailure("3D000", "database does not exist");
+    throw refusal("invalid_database_id");
   if (users.length !== 1 || !isRoleName(users[0]))
-    throw new AdmissionFailure("28P01", "authentication failed");
+    throw refusal("invalid_role_name");
   return { database: databases[0], user: users[0] };
 }
 
@@ -79,7 +79,7 @@ async function admit(
     } catch {
       // An upgrade already torn down by the transport needs no further close.
     }
-    throw new AdmissionFailure("08006", "connection admission interrupted");
+    throw refusal("admission_interrupted");
   }
   return { socket, region: region.id };
 }
@@ -140,7 +140,7 @@ export default {
       const failure =
         error instanceof AdmissionFailure
           ? error
-          : new AdmissionFailure("08006", "gateway connection failed");
+          : refusal("gateway_unavailable");
       outcome = failure.sqlstate;
       return failure.decoy && hints
         ? decoyResponse(hints, env.ROUTE_MASTER_KEYS, request.signal, ctx)

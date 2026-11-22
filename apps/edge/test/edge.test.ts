@@ -208,6 +208,13 @@ async function errorCode(
   return fields.find((field) => field.startsWith("C"))!.slice(1);
 }
 
+/** The message of the refusal an `errorCode` call has seen. */
+function errorMessage(connection: Awaited<ReturnType<typeof open>>): string {
+  const bytes = connection.messages.find((message) => message[0] === 0x45)!;
+  const fields = new TextDecoder().decode(bytes.subarray(5)).split("\0");
+  return fields.find((field) => field.startsWith("M"))!.slice(1);
+}
+
 async function assertRealRateDenied(
   original: Parameters<typeof open>[0],
   attempted: Parameters<typeof open>[0],
@@ -833,6 +840,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       await seedKnownDatabase(testEnv, database);
       const connection = await open();
       expect(await errorCode(connection)).toBe("57P03");
+      expect(errorMessage(connection)).toBe(
+        "database is not accepting connections (pgcf: database_not_accepting)",
+      );
     }
     await testEnv.DB.prepare(
       "UPDATE databases SET desired_state = 'deleted', deleted_at = ? WHERE id = ?",
@@ -1397,6 +1407,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     ]) {
       const connection = await open({ ip });
       expect(await errorCode(connection)).toBe("53300");
+      expect(errorMessage(connection)).toBe(
+        "connection rate limit exceeded (pgcf: rate_limited)",
+      );
     }
     expect(await stats()).toHaveLength(0);
   });
@@ -1454,6 +1467,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   it("rejects malformed and reserved hints without contacting a gateway", async () => {
     const invalidDatabase = await open({ database: "invalid" });
     expect(await errorCode(invalidDatabase)).toBe("3D000");
+    expect(errorMessage(invalidDatabase)).toBe(
+      "database does not exist (pgcf: invalid_database_id)",
+    );
     const reservedRole = await open({ user: "postgres" });
     expect(await errorCode(reservedRole)).toBe("28P01");
     const reservedPrefix = await open({ user: "pg_reserved" });
