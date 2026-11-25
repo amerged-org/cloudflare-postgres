@@ -30,6 +30,7 @@ mod postgres_tests;
 pub mod protocol;
 pub mod recovery;
 pub mod restore;
+pub(crate) mod safe_fs;
 pub mod server;
 #[cfg(test)]
 pub(crate) mod test_support;

@@ -26,8 +26,26 @@ export async function limitRequests(
   await next();
 }
 
+const EXEMPT_NODE_EXACT = new Set([
+  "/node/v1/link",
+  "/node/v1/desired",
+  "/node/v1/credentials",
+  "/node/v1/observations",
+  "/node/v1/volumes",
+  "/node/v1/events",
+  "/node/v1/usage",
+  "/node/v1/data-events",
+  "/node/v1/diagnostics",
+]);
+const EXEMPT_NODE_PREFIXES = [
+  "/node/v1/archive-credentials/",
+  "/node/v1/cold-snapshots/",
+] as const;
+
 const exemptFromLimit = (path: string): boolean =>
-  path === "/healthz" || path === "/node/v1" || path.startsWith("/node/v1/");
+  path === "/healthz" ||
+  EXEMPT_NODE_EXACT.has(path) ||
+  EXEMPT_NODE_PREFIXES.some((prefix) => path.startsWith(prefix));
 
 /**
  * A deployment whose namespace is not bound serves without the limit, and says so once per isolate:

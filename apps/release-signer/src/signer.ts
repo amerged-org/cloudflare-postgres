@@ -42,6 +42,8 @@ export interface Env {
   SIGNER_REPOSITORY_OWNER_ID?: string;
   SIGNER_REF?: string;
   SIGNER_WORKFLOW?: string;
+  /** Optional explicit HTTPS origin pinned as the expected GitHub OIDC audience. */
+  SIGNER_AUDIENCE?: string;
 }
 
 /**
@@ -122,7 +124,21 @@ function policyOf(env: Env, request: Request): Policy {
     !/^\.github\/workflows\/[A-Za-z0-9_.-]+\.ya?ml$/.test(workflow)
   )
     throw new Refusal(500, "signer_misconfigured");
-  // The audience is the address the run reached this Worker at, which it asked GitHub for.
+  let audience: string;
+  if (env.SIGNER_AUDIENCE !== undefined) {
+    let parsed: URL;
+    try {
+      parsed = new URL(env.SIGNER_AUDIENCE);
+    } catch {
+      throw new Refusal(500, "signer_misconfigured");
+    }
+    if (parsed.protocol !== "https:" || parsed.origin !== env.SIGNER_AUDIENCE)
+      throw new Refusal(500, "signer_misconfigured");
+    audience = parsed.origin;
+  } else {
+    // The audience is the address the run reached this Worker at, which it asked GitHub for.
+    audience = new URL(request.url).origin;
+  }
   return {
     repository,
     repositoryId,
@@ -130,7 +146,7 @@ function policyOf(env: Env, request: Request): Policy {
     ref,
     workflow,
     environment: RELEASE_ENVIRONMENT,
-    audience: new URL(request.url).origin,
+    audience,
   };
 }
 

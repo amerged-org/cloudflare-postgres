@@ -174,6 +174,18 @@ describe("who mints integrator keys", () => {
       project_id: f.project,
     });
     expect(owner.api_key).toMatchObject({ scope: "integrator" });
+    const audit = await rowsOf();
+    expect(audit).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          key_id: "key_00000000000000000000",
+          scope: "admin",
+          method: "POST",
+          route: "/v1/api-keys",
+          status: 201,
+        }),
+      ]),
+    );
     // An integrator key mints for its own project only, and no administrator key at all.
     const sibling = await request("/v1/api-keys", owner.key, "POST", {
       name: "acct-sibling",

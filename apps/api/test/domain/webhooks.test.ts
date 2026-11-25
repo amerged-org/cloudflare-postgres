@@ -615,3 +615,45 @@ it("takes the webhook limit of a project from the installation", async () => {
   );
   expect(fallback.status).toBe(201);
 });
+
+it("refuses forbidden smuggling headers, platform hosts, and admin data.* subscriptions", async () => {
+  const f = await fixture();
+  for (const header of [
+    "X-PGCF-Diagnostic-Id",
+    "Neon-Connection-String",
+    "Cookie",
+    "Forwarded",
+    "X-Real-Ip",
+    "True-Client-IP",
+    "Proxy-Authorization",
+    "X-Amz-Security-Token",
+  ])
+    expect(
+      (await subscribe(f, { headers: { [header]: "x" } })).status,
+      header,
+    ).toBe(400);
+
+  for (const url of [
+    "https://edge.cfargotunnel.com/hook",
+    `https://${env.DB_ENDPOINT_HOST}/sql`,
+  ])
+    expect((await subscribe(f, { url })).status, url).toBe(400);
+
+  for (const pattern of ["data.*", "data.orders"]) {
+    const adminRes = await subscribe(
+      f,
+      { project_id: f.project, event_types: [pattern] },
+      f.admin,
+    );
+    expect(await refusal(adminRes), pattern).toMatchObject({
+      status: 403,
+      code: "forbidden",
+    });
+    const integratorRes = await subscribe(
+      f,
+      { event_types: [pattern] },
+      f.integrator,
+    );
+    expect(integratorRes.status, pattern).toBe(201);
+  }
+});

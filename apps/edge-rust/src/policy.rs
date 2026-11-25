@@ -240,6 +240,18 @@ pub struct Limit {
     pub key: String,
     pub message: &'static str,
 }
+/// Coarse per-source limiter across all databases and roles; skipped for service-binding callers.
+pub fn source_limit(network: &str) -> Option<Limit> {
+    if network == "binding" {
+        return None;
+    }
+    Some(Limit {
+        binding: "SOURCE_RATE_LIMITER",
+        key: network.into(),
+        message: "connection rate limit exceeded",
+    })
+}
+
 /// The limiters of one request, in the order their refusals take precedence. `network` is the
 /// caller's `connection_rate_key`; `scope` prefixes the keys, so that a kind of request (HTTP
 /// queries: `["sql"]`) counts in buckets of its own of the same limiters. A same-account Worker

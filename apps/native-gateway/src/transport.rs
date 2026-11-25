@@ -49,6 +49,8 @@ pub const STARTUP_BOUND: Duration = Duration::from_secs(10);
 pub const AUTHENTICATION_BOUND: Duration = Duration::from_secs(10);
 /// How long a held wake connection waits for its release, counted from its upgrade.
 pub const WAKE_BOUND: Duration = Duration::from_millis(wake::WAKE_BOUND_MS);
+/// Maximum pipelined bytes buffered behind a StartupMessage while a cold-wake connection waits.
+const MAX_HELD_PIPELINED_BYTES: usize = 64 * 1024;
 /// The time one write of frontend bytes to PostgreSQL may take.
 pub(crate) const WRITE_BOUND: Duration = Duration::from_secs(10);
 pub struct Config {
@@ -1156,7 +1158,15 @@ async fn serve_held(
             // it, within the connection's memory.
             message = websocket.next() => match message {
                 Some(Ok(Message::Binary(bytes))) => {
-                    started.leases.push(wire.take_message().inspect_err(|_| stages.outcome = "websocket_error")?);
+                    let lease = wire.take_message().inspect_err(|_| stages.outcome = "websocket_error")?;
+                    if started.rest.len().saturating_add(bytes.len()) > MAX_HELD_PIPELINED_BYTES {
+                        stages.verdict = Some(held.release());
+                        stages.held_outcome = Some("startup_too_large");
+                        stages.outcome = "startup_too_large";
+                        let _ = send_error(&mut websocket, "08P01", "startup message too large").await;
+                        return Ok(());
+                    }
+                    started.leases.push(lease);
                     started.rest.extend_from_slice(&bytes);
                 }
                 Some(Ok(Message::Ping(value))) => send_client(&mut websocket, Message::Pong(value), &mut stages).await?,
@@ -1276,7 +1286,7 @@ async fn run_session(
     let Started {
         startup,
         leases: initial_leases,
-        rest,
+        mut rest,
         password,
         ..
     } = started;
@@ -1285,27 +1295,29 @@ async fn run_session(
         activity.observe_frontend(&rest);
         // A client that logs in itself sends what it pipelined with its StartupMessage; for one
         // the gateway logs in for, those bytes wait for the login.
-        let mut initial = startup;
-        if password.is_none() {
-            initial.extend_from_slice(&rest);
-        }
-        update(gateway, id, &activity, true, false);
-        match gateway
-            .write_admitted(id, &claims.db, target, &mut postgres, &initial)
-            .await
         {
-            Ok(()) => {}
-            Err(Blocked::Fenced) => {
-                stages.outcome = "fenced";
-                return Err("startup fenced before first upstream write".into());
+            let mut initial = startup;
+            if password.is_none() {
+                initial.extend_from_slice(&rest);
             }
-            Err(Blocked::TargetChanged) => {
-                stages.outcome = "target_changed";
-                return Err("writer changed before first upstream write".into());
-            }
-            Err(Blocked::Lost) => {
-                stages.outcome = "postgres_error";
-                return Err("first upstream write failed".into());
+            update(gateway, id, &activity, true, false);
+            match gateway
+                .write_admitted(id, &claims.db, target, &mut postgres, &initial)
+                .await
+            {
+                Ok(()) => {}
+                Err(Blocked::Fenced) => {
+                    stages.outcome = "fenced";
+                    return Err("startup fenced before first upstream write".into());
+                }
+                Err(Blocked::TargetChanged) => {
+                    stages.outcome = "target_changed";
+                    return Err("writer changed before first upstream write".into());
+                }
+                Err(Blocked::Lost) => {
+                    stages.outcome = "postgres_error";
+                    return Err("first upstream write failed".into());
+                }
             }
         }
         stages.written = Some(Instant::now());
@@ -1350,10 +1362,15 @@ async fn run_session(
             update(gateway, id, &activity, true, false);
             send_client(websocket, Message::Binary(answer.into()), stages).await?;
             stages.first_backend = Some(Instant::now());
-            if !rest.is_empty() {
-                held = Some((rest.to_vec(), initial_leases));
+            let trailing = std::mem::take(&mut *rest);
+            drop(rest);
+            if !trailing.is_empty() {
+                held = Some((trailing, initial_leases));
+            } else {
+                drop(initial_leases);
             }
         } else {
+            drop(rest);
             drop(initial_leases);
         }
         wire.allow_relay();

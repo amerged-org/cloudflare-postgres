@@ -68,7 +68,10 @@ pub fn present_access(
     let secret = |name: &str| env.secret(name).ok().map(|value| value.to_string());
     let (id, secret) = (secret("ACCESS_CLIENT_ID"), secret("ACCESS_CLIENT_SECRET"));
     match access(id.as_deref(), secret.as_deref()) {
-        Access::Absent => Ok(()),
+        Access::Absent => {
+            timings.borrow_mut().config_error = Some(wire("accessSecretsMissing"));
+            Err(Failure::gateway())
+        }
         Access::Incomplete => {
             timings.borrow_mut().config_error = Some(wire("accessSecretsIncomplete"));
             Err(Failure::gateway())

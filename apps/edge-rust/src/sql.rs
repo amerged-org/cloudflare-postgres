@@ -245,21 +245,32 @@ fn statement(value: &Value) -> Result<Statement, SqlFailure> {
     }
     let params = match object.get("params") {
         None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(params)) => params
-            .iter()
-            .map(|param| match param {
-                Value::Null => Ok(None),
-                Value::String(text) => Ok(Some(text.clone())),
-                // The driver sends text or null; other JSON scalars are sent as their text.
-                Value::Number(number) => Ok(Some(number_text(
-                    number.as_f64().ok_or_else(SqlFailure::invalid)?,
-                ))),
-                Value::Bool(flag) => Ok(Some(flag.to_string())),
-                _ => Err(SqlFailure::invalid()),
-            })
-            .collect::<Result<_, _>>()?,
+        Some(Value::Array(params)) => {
+            if params.len() > 65_535 {
+                return Err(SqlFailure::invalid());
+            }
+            params
+                .iter()
+                .map(|param| match param {
+                    Value::Null => Ok(None),
+                    Value::String(text) => Ok(Some(text.clone())),
+                    // The driver sends text or null; other JSON scalars are sent as their text.
+                    Value::Number(number) => Ok(Some(number_text(
+                        number.as_f64().ok_or_else(SqlFailure::invalid)?,
+                    ))),
+                    Value::Bool(flag) => Ok(Some(flag.to_string())),
+                    _ => Err(SqlFailure::invalid()),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
         Some(_) => return Err(SqlFailure::invalid()),
     };
+    if query.contains('\0') || params.iter().flatten().any(|v| v.contains('\0')) {
+        return Err(SqlFailure::new(
+            "22021",
+            "invalid byte sequence for encoding \"UTF8\": 0x00",
+        ));
+    }
     Ok(Statement {
         query: query.into(),
         params,

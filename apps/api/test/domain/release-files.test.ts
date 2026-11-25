@@ -27,6 +27,7 @@ import {
   forgetInstalls,
   progress,
   sources,
+  v4,
 } from "./node-fixtures.ts";
 
 afterEach(async () => {
@@ -61,7 +62,10 @@ async function registered() {
 }
 const get = (path: string, headers: HeadersInit = {}, method = "GET") =>
   rawRequest(path, { method, headers });
-const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
+const bearer = (token: string, address: string | null = v4) => ({
+  Authorization: `Bearer ${token}`,
+  ...(address ? { "CF-Connecting-IP": address } : {}),
+});
 
 describe("the files every node reads", () => {
   it("serves a release's binaries and package lock to anyone, as the agent reads them without a credential", async () => {
@@ -297,6 +301,12 @@ describe("the image", () => {
     const response = await get(path, bearer(i.issued.progress_token));
     expect(response.status).toBe(200);
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(r.body(image));
+    expect(
+      (await get(path, bearer(i.issued.progress_token, "192.0.2.99"))).status,
+    ).toBe(403);
+    expect(
+      (await get(path, bearer(i.issued.progress_token, null))).status,
+    ).toBe(403);
     expect(await refusal(await get(path))).toMatchObject({
       status: 401,
       code: "unauthorized",

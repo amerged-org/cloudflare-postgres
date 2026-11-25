@@ -105,24 +105,25 @@ pub struct ReadyFile {
     pub since_ms: i64,
 }
 /// The WAL files of `data_directory` that wait for archive, from `pg_wal/archive_status`.
+/// Traverses via FD-anchored `O_NOFOLLOW` + `st_dev` checks so a tenant-planted symlink cannot
+/// redirect the root agent into another directory.
 pub fn ready_files(data_directory: &Path) -> io::Result<Vec<ReadyFile>> {
+    let data = super::safe_fs::open_dir_root_nofollow(data_directory)?;
+    let wal = super::safe_fs::open_dir_child_same_dev(&data, "pg_wal")?;
+    let status = super::safe_fs::open_dir_child_same_dev(&wal, "archive_status")?;
     let mut ready = Vec::new();
-    for entry in std::fs::read_dir(data_directory.join("pg_wal/archive_status"))? {
-        let entry = entry?;
-        let file = entry.file_name();
-        let Some(name) = file
-            .to_str()
-            .and_then(|file| file.strip_suffix(".ready"))
-            .filter(|name| valid_name(name))
-        else {
+    for file in super::safe_fs::read_dir_names(&status)? {
+        let Some(name) = file.strip_suffix(".ready").filter(|name| valid_name(name)) else {
             continue;
         };
-        let since = entry.metadata()?.modified()?;
+        let Ok(info) = super::safe_fs::stat_regular_same_dev(&status, &file) else {
+            continue;
+        };
+        let secs = info.st_mtime.max(0);
+        let nanos = info.st_mtime_nsec.max(0);
         ready.push(ReadyFile {
             name: name.into(),
-            since_ms: since
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |since| since.as_millis() as i64),
+            since_ms: secs.saturating_mul(1000).saturating_add(nanos / 1_000_000),
         });
     }
     ready.sort_by(|a, b| a.name.cmp(&b.name));
@@ -383,6 +384,13 @@ mod tests {
             .as_millis() as i64;
         assert!((now - ready[0].since_ms).abs() < 5_000);
         assert!(ready_files(&directory.join("missing")).is_err());
+        // Symlinked pg_wal or archive_status must be refused rather than followed as root.
+        let symlinked = crate::archive::test_support::directory("ready-symlink");
+        let outside = crate::archive::test_support::directory("ready-outside");
+        std::fs::write(outside.join("000000010000000000000001.ready"), b"").unwrap();
+        std::fs::create_dir_all(symlinked.join("pg_wal")).unwrap();
+        std::os::unix::fs::symlink(&outside, symlinked.join("pg_wal/archive_status")).unwrap();
+        assert!(ready_files(&symlinked).is_err());
     }
 
     #[test]

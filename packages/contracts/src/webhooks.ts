@@ -80,7 +80,7 @@ export const WEBHOOK_MAX_HEADERS = 8;
 export const EVENT_PATTERN = /^(\*|[a-z][a-z_]*\.(\*|[a-z][a-z0-9_]*))$/;
 const EventPattern = z.string().max(64).regex(EVENT_PATTERN);
 
-// Names the service sets itself, or that would change how the request is framed.
+// Names the service sets itself, or that would change how the request is framed or routed.
 const FORBIDDEN_HEADERS = new Set([
   "host",
   "content-length",
@@ -91,19 +91,38 @@ const FORBIDDEN_HEADERS = new Set([
   "te",
   "upgrade",
   "expect",
+  "cookie",
+  "forwarded",
+  "x-real-ip",
+  "true-client-ip",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "trailer",
 ]);
+const FORBIDDEN_HEADER_PREFIXES = [
+  "pgcf-",
+  "x-pgcf-",
+  "cf-",
+  "x-forwarded-",
+  "neon-",
+  "proxy-",
+  "x-amz-",
+] as const;
+
+export function isAllowedWebhookHeaderName(name: string): boolean {
+  if (!/^[A-Za-z][A-Za-z0-9-]{0,63}$/.test(name)) return false;
+  const lower = name.toLowerCase();
+  return (
+    !FORBIDDEN_HEADERS.has(lower) &&
+    !FORBIDDEN_HEADER_PREFIXES.some((prefix) => lower.startsWith(prefix))
+  );
+}
+
 const HeaderName = z
   .string()
   .regex(/^[A-Za-z][A-Za-z0-9-]{0,63}$/)
-  .refine((name) => {
-    const lower = name.toLowerCase();
-    return (
-      !FORBIDDEN_HEADERS.has(lower) &&
-      !lower.startsWith("pgcf-") &&
-      !lower.startsWith("cf-") &&
-      !lower.startsWith("x-forwarded-")
-    );
-  }, "reserved header name");
+  .refine(isAllowedWebhookHeaderName, "reserved header name");
 const HeaderValue = z
   .string()
   .min(1)

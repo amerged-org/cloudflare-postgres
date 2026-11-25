@@ -16,7 +16,10 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+};
 
 /// Route token v6 claims.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -310,6 +313,8 @@ pub fn verify(
 pub struct ReplayCache {
     maximum: usize,
     entries: HashMap<String, HashMap<String, u64>>,
+    expiries: BinaryHeap<Reverse<(u64, u64, String, String)>>,
+    next_seq: u64,
 }
 impl ReplayCache {
     pub fn new(maximum: usize) -> Self {
@@ -317,6 +322,27 @@ impl ReplayCache {
         Self {
             maximum,
             entries: HashMap::new(),
+            expiries: BinaryHeap::new(),
+            next_seq: 0,
+        }
+    }
+    fn evict_expired(&mut self, now_ms: u64) {
+        while let Some(Reverse((expiry, _, _, _))) = self.expiries.peek() {
+            if *expiry >= now_ms {
+                break;
+            }
+            let Reverse((expiry, _, database, cid)) = self.expiries.pop().unwrap();
+            let remove_partition = if let Some(partition) = self.entries.get_mut(&database) {
+                if partition.get(&cid).copied() == Some(expiry) {
+                    partition.remove(&cid);
+                }
+                partition.is_empty()
+            } else {
+                false
+            };
+            if remove_partition {
+                self.entries.remove(&database);
+            }
         }
     }
     /// Records the connection `cid` of `database`, whose token expires at `exp` (Unix seconds).
@@ -327,10 +353,7 @@ impl ReplayCache {
         exp: u64,
         now_ms: u64,
     ) -> Result<(), &'static str> {
-        self.entries.retain(|_, entries| {
-            entries.retain(|_, expiry| *expiry >= now_ms);
-            !entries.is_empty()
-        });
+        self.evict_expired(now_ms);
         let expiry = (exp + constant("ROUTE_TOKEN_SKEW_SECONDS"))
             .checked_mul(1000)
             .ok_or("full")?;
@@ -350,6 +373,14 @@ impl ReplayCache {
             return Err("full");
         }
         partition.insert(cid.to_string(), expiry);
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        self.expiries.push(Reverse((
+            expiry,
+            seq,
+            database.to_string(),
+            cid.to_string(),
+        )));
         Ok(())
     }
 }

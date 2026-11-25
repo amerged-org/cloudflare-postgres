@@ -4,7 +4,7 @@ use crate::{
     policy::{self, Failure, GatewayRegion, Hints, Log, Signable, Timings},
 };
 use futures_channel::oneshot;
-use futures_util::future::{Either, join, join_all, select};
+use futures_util::future::{Either, join_all, select};
 use pgcf_native_protocol::{
     constant,
     route::{self, Keyring},
@@ -56,18 +56,72 @@ pub struct Admit {
     /// buckets of its own of the same limiters.
     pub scope: &'static [&'static str],
 }
+async fn count_limits(
+    env: &Env,
+    limits: &[policy::Limit],
+    signal: &AbortSignal,
+    timings: &Shared,
+) -> Result<(), Failure> {
+    let started = host::now();
+    let outcomes = join_all(limits.iter().map(|limit| async {
+        let limiter = env.rate_limiter(limit.binding).map_err(|_| ())?;
+        let outcome = limiter.limit(limit.key.clone()).await;
+        let elapsed = host::now().saturating_sub(started);
+        let mut t = timings.borrow_mut();
+        t.limiters_ms = Some(t.limiters_ms.unwrap_or(0).max(elapsed));
+        outcome.map(|outcome| outcome.success).map_err(|_| ())
+    }))
+    .await;
+    host::check(signal)?;
+    if let Some(failure) = policy::limit_failure(limits, &outcomes) {
+        return Err(failure);
+    }
+    Ok(())
+}
+
+/// Counts the source and per-route limiters sequentially before any body read or Actor wake.
+pub async fn limit_route(
+    env: &Env,
+    hints: &Hints,
+    source: Option<&str>,
+    signal: &AbortSignal,
+    timings: &Shared,
+    scope: &[&str],
+) -> Result<(), Failure> {
+    host::check(signal)?;
+    let network = policy::connection_rate_key(source).ok_or_else(Failure::rate)?;
+    if let Some(source_limit) = policy::source_limit(&network) {
+        count_limits(env, &[source_limit], signal, timings).await?;
+    }
+    let limits = policy::limits(&network, hints, scope);
+    count_limits(env, &limits, signal, timings).await
+}
+
 impl Admit {
     /// The limiters, one of the Actor's admission, and the route signed for the gateway of the
-    /// node that serves the database. The limiters and the Actor's admission run together: none
-    /// of them waits for another, so the per-database bucket also counts connects that
-    /// admission refuses.
+    /// node that serves the database. Limiters always run before the Actor's admission so a
+    /// rate-limited caller never wakes a sleeping database.
     pub async fn route(&self) -> Result<(GatewayRegion, String), Failure> {
+        self.route_with_limits(false).await
+    }
+
+    pub async fn route_with_limits(
+        &self,
+        counted: bool,
+    ) -> Result<(GatewayRegion, String), Failure> {
         host::check(&self.signal)?;
-        let network =
-            policy::connection_rate_key(self.source.as_deref()).ok_or_else(Failure::rate)?;
-        // Shared proxy networks must not couple unrelated database/role routes. These untrusted
-        // hints scope admission; PostgreSQL authenticates the user.
-        let limits = policy::limits(&network, &self.hints, self.scope);
+        if !counted {
+            limit_route(
+                &self.env,
+                &self.hints,
+                self.source.as_deref(),
+                &self.signal,
+                &self.timings,
+                self.scope,
+            )
+            .await?;
+        }
+        host::check(&self.signal)?;
         let actor = host::actor(&self.env, &self.hints.database)?;
         let cancel = host::cancel_on_abort(
             &self.signal,
@@ -83,30 +137,15 @@ impl Admit {
         })
         .map_err(|_| Failure::gateway())?;
         let started = host::now();
-        let admission = async {
-            let result = match actor.admit_wake(&self.hints.database, &self.hints.user, &options) {
-                Ok(promise) => JsFuture::from(promise)
-                    .await
-                    .map_err(|_| Failure::gateway()),
-                Err(_) => Err(Failure::gateway()),
-            };
-            self.timings.borrow_mut().admit_ms = Some(host::now().saturating_sub(started));
-            result
+        let admission = match actor.admit_wake(&self.hints.database, &self.hints.user, &options) {
+            Ok(promise) => JsFuture::from(promise)
+                .await
+                .map_err(|_| Failure::gateway()),
+            Err(_) => Err(Failure::gateway()),
         };
-        let limited = join_all(limits.iter().map(|limit| async {
-            let limiter = self.env.rate_limiter(limit.binding).map_err(|_| ())?;
-            let outcome = limiter.limit(limit.key.clone()).await;
-            let elapsed = host::now().saturating_sub(started);
-            let mut timings = self.timings.borrow_mut();
-            timings.limiters_ms = Some(timings.limiters_ms.unwrap_or(0).max(elapsed));
-            outcome.map(|outcome| outcome.success).map_err(|_| ())
-        }));
-        let (admission, outcomes) = join(admission, limited).await;
+        self.timings.borrow_mut().admit_ms = Some(host::now().saturating_sub(started));
         drop(cancel);
         host::check(&self.signal)?;
-        if let Some(failure) = policy::limit_failure(&limits, &outcomes) {
-            return Err(failure);
-        }
         let admitted = policy::admission(
             &serde_wasm_bindgen::from_value::<Value>(admission?).map_err(|_| Failure::gateway())?,
         )?;

@@ -27,13 +27,7 @@ use crate::{
     units::limits::{Io, Limits},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, fchown},
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{io, path::Path, sync::Arc, time::Duration};
 
 /// The files of a cluster's configuration: name and content.
 type Configuration = [(&'static str, String); 4];
@@ -168,65 +162,53 @@ fn volume_error(error: &storage::Error) -> &'static str {
 }
 
 /// Writes a file of the database's cluster as root, below a directory its user can rearrange:
-/// whatever is there is unlinked, which follows nothing, and the file is created exclusively,
-/// which fails on a link that appears in between, and handed over by its descriptor. This is done
-/// only while the database's unit is stopped.
+/// the parent directory is anchored with `O_DIRECTORY | O_NOFOLLOW`, whatever is there is unlinked
+/// via `unlinkat`, and the file is created exclusively via `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` and
+/// handed over by its descriptor. This is done only while the database's unit is stopped.
 pub(super) fn write_owned(
     dir: &Path,
     name: &str,
     content: &str,
     account: &Account,
 ) -> io::Result<()> {
-    let path = dir.join(name);
-    match std::fs::remove_file(&path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-        _ => {}
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?;
-    file.write_all(content.as_bytes())?;
-    fchown(&file, Some(account.uid), Some(account.gid))?;
-    file.sync_all()
+    let parent = crate::archive::safe_fs::open_dir_root_nofollow(dir)?;
+    crate::archive::safe_fs::write_owned_at(&parent, name, content, account.uid, account.gid)
 }
 
 /// Copied archive acknowledgements name the old prefix. Re-arm only complete files that
 /// still exist, plus every timeline history, before PostgreSQL uses the new archive prefix.
 fn rearm_snapshot_archive(data: &Path, account: &Account) -> io::Result<Vec<String>> {
-    let wal = data.join("pg_wal");
-    let status = wal.join("archive_status");
+    let data_dir = crate::archive::safe_fs::open_dir_root_nofollow(data)?;
+    let wal = crate::archive::safe_fs::open_dir_child_same_dev(&data_dir, "pg_wal")?;
+    let status = crate::archive::safe_fs::open_dir_child_same_dev(&wal, "archive_status")?;
     let mut names = std::collections::BTreeSet::new();
-    for item in std::fs::read_dir(&status)? {
-        let item = item?;
-        let name = item.file_name();
-        if let Some(name) = name.to_str().and_then(|value| value.strip_suffix(".done"))
+    for entry in crate::archive::safe_fs::read_dir_names(&status)? {
+        if let Some(name) = entry.strip_suffix(".done")
             && crate::archive::protocol::valid_name(name)
-            && wal.join(name).is_file()
+            && crate::archive::safe_fs::stat_regular_same_dev(&wal, name).is_ok()
         {
             names.insert(name.to_string());
         }
     }
-    for item in std::fs::read_dir(&wal)? {
-        let item = item?;
-        let name = item.file_name();
-        if let Some(name) = name.to_str()
-            && name.ends_with(".history")
-            && crate::archive::protocol::valid_name(name)
-            && item.file_type()?.is_file()
+    for entry in crate::archive::safe_fs::read_dir_names(&wal)? {
+        if entry.ends_with(".history")
+            && crate::archive::protocol::valid_name(&entry)
+            && crate::archive::safe_fs::stat_regular_same_dev(&wal, &entry).is_ok()
         {
-            names.insert(name.to_string());
+            names.insert(entry);
         }
     }
     for name in &names {
-        match std::fs::remove_file(status.join(format!("{name}.done"))) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
-        write_owned(&status, &format!("{name}.ready"), "", account)?;
+        crate::archive::safe_fs::unlink_at(&status, &format!("{name}.done"))?;
+        crate::archive::safe_fs::write_owned_at(
+            &status,
+            &format!("{name}.ready"),
+            "",
+            account.uid,
+            account.gid,
+        )?;
     }
-    std::fs::File::open(&status)?.sync_all()?;
+    status.sync_all()?;
     Ok(names.into_iter().collect())
 }
 

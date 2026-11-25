@@ -688,16 +688,10 @@
         {
           "text": "{\"query\":\"SELECT \\u00e9, \\ud83d\\ude00, \\n, \\u0001, \\\"\",\"params\":[\"\\u00e9\\u0000x\"]}",
           "expected": {
-            "ok": true,
-            "value": {
-              "queries": [
-                {
-                  "query": "SELECT é, 😀, \n, \u0001, \"",
-                  "params": ["é\u0000x"]
-                }
-              ],
-              "batch": false
-            }
+            "ok": false,
+            "code": "22021",
+            "message": "invalid byte sequence for encoding \"UTF8\": 0x00",
+            "severity": "ERROR"
           }
         },
         {

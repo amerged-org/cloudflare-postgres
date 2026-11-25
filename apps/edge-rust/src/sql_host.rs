@@ -3,15 +3,12 @@
 //! route and forwarded once to the gateway of the node that serves the database, which runs it on
 //! a pooled PostgreSQL session. The Edge never retries a forwarded request.
 //!
-//! Not deployed, and not yet level with the TypeScript Edge on one point: `run` reads and parses
-//! the body before any admission, while `apps/edge/src/sql.ts` counts the request in the limiters
-//! first (`limitRoute`), from the headers alone, so that a client over its budget costs no body
-//! read. A deployment of this port must take the same order: the limiters, then the body, then the
-//! Actor's admission and the route (a route token lives 30 s).
+//! Limiters run from the headers alone before any body is read, parsed or validated, matching
+//! `apps/edge/src/sql.ts`; the Actor's admission and route signing follow the understood body.
 use crate::{
     gateway, host,
     policy::{self, Failure, GatewayRegion, Hints, Log},
-    runtime::{Admit, Late, Shared, bounded},
+    runtime::{Admit, Late, Shared, bounded, limit_route},
     sql::{self, Connection, SqlFailure},
 };
 use pgcf_native_protocol::wire;
@@ -202,6 +199,20 @@ async fn run(
     } = sql::connection(header(request, "Neon-Connection-String").as_deref())?;
     let hints = target.insert(Hints { database, user }).clone();
     let characteristics = sql::transaction(|name| header(request, name))?;
+    // HTTP requests count in buckets of their own, before any body is read or parsed.
+    let source = request
+        .headers()
+        .get("CF-Connecting-IP")
+        .map_err(|_| SqlFailure::from(Failure::rate()))?;
+    limit_route(
+        env,
+        &hints,
+        source.as_deref(),
+        &request.inner().signal(),
+        timings,
+        &["sql"],
+    )
+    .await?;
     let began = host::now();
     let understood = match read_body(request).await {
         Ok(text) => sql::statements(&text),
@@ -214,11 +225,6 @@ async fn run(
         return json(200, &serde_json::json!({"results": []})).map_err(|_| SqlFailure::gateway());
     }
     let body = sql::forward_body(&password, &understood, &characteristics)?;
-    // HTTP requests count in buckets of their own, so queries never take WebSocket handshakes.
-    let source = request
-        .headers()
-        .get("CF-Connecting-IP")
-        .map_err(|_| SqlFailure::from(Failure::rate()))?;
     let (admitting, cid, shared, owned) = (
         env.clone(),
         cid.to_string(),
@@ -241,7 +247,7 @@ async fn run(
                 timings: shared,
                 scope: &["sql"],
             };
-            let (region, token) = admit.route().await?;
+            let (region, token) = admit.route_with_limits(true).await?;
             Ok(Admitted { region, token })
         },
     )

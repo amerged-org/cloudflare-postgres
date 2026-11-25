@@ -30,7 +30,7 @@ import {
   secretSealContext,
 } from "./webhook-delivery.ts";
 import { derivedId } from "./webhook-events.ts";
-import { checkWebhookUrl } from "./webhook-url.ts";
+import { checkWebhookUrl, webhookUrlOptions } from "./webhook-url.ts";
 import { newWebhookSecret } from "./webhook-signing.ts";
 
 const WEBHOOK_TEST_INTERVAL_MS = 5_000;
@@ -118,8 +118,19 @@ export async function createWebhook(
   c: ApiContext,
   body: WebhookCreate,
 ): Promise<Response> {
+  const auth = await getAuth(c);
+  if (
+    isAdminScope(auth.scope) &&
+    body.event_types.some(
+      (pattern) => pattern === "data.*" || pattern.startsWith("data."),
+    )
+  )
+    throw new ApiError(
+      "forbidden",
+      "Only a project key can subscribe to data events",
+    );
   const projectId = await projectForCreate(c, body.project_id);
-  const url = checkWebhookUrl(body.url);
+  const url = checkWebhookUrl(body.url, webhookUrlOptions(c.env, c.req.url));
   if (!url.ok)
     throw new ApiError("invalid_request", `Webhook URL refused: ${url.reason}`);
   if (body.database_ids) {
@@ -287,6 +298,7 @@ export async function testWebhook(
       data: { message: "A test event from PGCF" },
     },
     await derivedId("dlv", `${eventId}|${id}`),
+    webhookUrlOptions(c.env, c.req.url),
   );
   const view: WebhookTestResult =
     result.kind === "delivered"

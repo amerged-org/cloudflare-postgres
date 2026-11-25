@@ -264,9 +264,7 @@ it("accepts a batch that lands exactly on the pending limit and refuses one deli
 it("never delivers a data event to a subscription of another project", async () => {
   const f = await fixture();
   const { id } = await served(f);
-  const foreign = await created(
-    await subscribe(f, { project_id: f.other }, f.admin),
-  );
+  const foreign = await created(await subscribe(f, {}, f.otherKey));
   const event = dataEvent(id, f.project, 1, 1, "orders", { order: 9 });
   const item = await itemFor(event, [foreign.id]);
   expect(await ingestBatch(id, [item])).toEqual({ ok: true, created: 1 });

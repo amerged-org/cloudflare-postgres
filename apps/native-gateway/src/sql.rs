@@ -586,20 +586,33 @@ async fn read_body(
         {
             return Err(invalid("invalid request"));
         }
-        let mut raw = Zeroizing::new(Vec::with_capacity(MAX_REQUEST_BYTES + 64 * 1024));
-        raw.extend_from_slice(&prefix[end..]);
-        let mut body = Zeroizing::new(Vec::with_capacity(MAX_REQUEST_BYTES));
-        let mut offset = 0;
+        const MAX_CHUNKED_WIRE_BYTES: usize = MAX_REQUEST_BYTES + 64 * 1024;
+        let mut raw = Zeroizing::new(prefix[end..].to_vec());
+        let mut wire_bytes = raw.len();
+        if wire_bytes > MAX_CHUNKED_WIRE_BYTES {
+            return Err(too_large());
+        }
+        let mut body = Zeroizing::new(Vec::new());
         let deadline = tokio::time::Instant::now() + BODY_BOUND;
         loop {
             // Parses what has arrived; reads more only when a chunk is incomplete.
-            match httparse::parse_chunk_size(&raw[offset..]) {
+            match httparse::parse_chunk_size(&raw) {
                 Ok(httparse::Status::Complete((consumed, 0))) => {
                     // The last chunk; trailers are not accepted.
-                    while raw.len() < offset + consumed + 2 {
-                        read_more(socket, &mut raw, deadline).await?;
+                    let need = consumed + 2;
+                    while raw.len() < need {
+                        let missing = need - raw.len();
+                        read_more(
+                            socket,
+                            &mut raw,
+                            &mut wire_bytes,
+                            MAX_CHUNKED_WIRE_BYTES,
+                            missing,
+                            deadline,
+                        )
+                        .await?;
                     }
-                    if &raw[offset + consumed..offset + consumed + 2] != b"\r\n" {
+                    if &raw[consumed..consumed + 2] != b"\r\n" {
                         return Err(invalid("invalid request"));
                     }
                     return Ok(body);
@@ -609,24 +622,43 @@ async fn read_body(
                     if size > MAX_REQUEST_BYTES - body.len() {
                         return Err(too_large());
                     }
-                    let start = offset + consumed;
-                    while raw.len() < start + size + 2 {
-                        read_more(socket, &mut raw, deadline).await?;
-                    }
-                    if &raw[start + size..start + size + 2] != b"\r\n" {
-                        return Err(invalid("invalid request"));
-                    }
+                    // Lease before reading or growing buffers for this chunk.
                     if !memory.grow(request_memory(size)) {
                         return Err(memory_refused());
                     }
-                    body.extend_from_slice(&raw[start..start + size]);
-                    offset = start + size + 2;
-                }
-                Ok(httparse::Status::Partial) => {
-                    if raw.len() - offset > 1024 {
+                    let start = consumed;
+                    let end_of_chunk = start + size + 2;
+                    while raw.len() < end_of_chunk {
+                        let missing = end_of_chunk - raw.len();
+                        read_more(
+                            socket,
+                            &mut raw,
+                            &mut wire_bytes,
+                            MAX_CHUNKED_WIRE_BYTES,
+                            missing,
+                            deadline,
+                        )
+                        .await?;
+                    }
+                    if &raw[start + size..end_of_chunk] != b"\r\n" {
                         return Err(invalid("invalid request"));
                     }
-                    read_more(socket, &mut raw, deadline).await?;
+                    body.extend_from_slice(&raw[start..start + size]);
+                    raw.drain(..end_of_chunk);
+                }
+                Ok(httparse::Status::Partial) => {
+                    if raw.len() > 1024 {
+                        return Err(invalid("invalid request"));
+                    }
+                    read_more(
+                        socket,
+                        &mut raw,
+                        &mut wire_bytes,
+                        MAX_CHUNKED_WIRE_BYTES,
+                        1024,
+                        deadline,
+                    )
+                    .await?;
                 }
                 Err(_) => return Err(invalid("invalid request")),
             }
@@ -659,18 +691,24 @@ async fn read_body(
 async fn read_more(
     socket: &mut TcpStream,
     raw: &mut Zeroizing<Vec<u8>>,
+    wire_bytes: &mut usize,
+    max_wire_bytes: usize,
+    wanted: usize,
     deadline: tokio::time::Instant,
 ) -> Result<(), Refused> {
-    if raw.len() >= raw.capacity() {
+    let remaining = max_wire_bytes.saturating_sub(*wire_bytes);
+    if remaining == 0 {
         return Err(refused(
             "request_too_large",
             "54000",
             "request is too large",
         ));
     }
-    let mut chunk = Zeroizing::new(vec![0; (raw.capacity() - raw.len()).min(64 * 1024)]);
+    let to_read = wanted.clamp(1, 64 * 1024).min(remaining);
+    let mut chunk = Zeroizing::new(vec![0; to_read]);
     match tokio::time::timeout_at(deadline, socket.read(&mut chunk)).await {
         Ok(Ok(length)) if length > 0 => {
+            *wire_bytes += length;
             raw.extend_from_slice(&chunk[..length]);
             Ok(())
         }
@@ -1005,15 +1043,45 @@ enum Guard {
     /// The write failed: its bytes may have reached PostgreSQL.
     Lost,
 }
-async fn read_message(postgres: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
+/// Maximum size of a PostgreSQL message accepted while recycling an idle session.
+const MAX_RECYCLE_MESSAGE_BYTES: usize = 64 * 1024;
+
+enum ReadMessageError {
+    Memory,
+    Io,
+}
+
+async fn read_message_bounded(
+    postgres: &mut UnixStream,
+    max_body: usize,
+    memory: Option<&mut Lease>,
+) -> Result<(u8, Vec<u8>), ReadMessageError> {
     let mut header = [0; 5];
-    postgres.read_exact(&mut header).await?;
+    postgres
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| ReadMessageError::Io)?;
     let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-    if !(4..=MAX_RESPONSE_BYTES + 4).contains(&length) {
-        return Err(std::io::Error::other("PostgreSQL message too large"));
+    if length < 4 || length - 4 > max_body {
+        return Err(ReadMessageError::Io);
     }
-    let mut body = vec![0; length - 4];
-    postgres.read_exact(&mut body).await?;
+    let payload_len = length - 4;
+    if let Some(lease) = memory {
+        if !lease.grow(payload_len) {
+            return Err(ReadMessageError::Memory);
+        }
+        let mut body = vec![0; payload_len];
+        if postgres.read_exact(&mut body).await.is_err() {
+            lease.shrink(payload_len);
+            return Err(ReadMessageError::Io);
+        }
+        return Ok((header[0], body));
+    }
+    let mut body = vec![0; payload_len];
+    postgres
+        .read_exact(&mut body)
+        .await
+        .map_err(|_| ReadMessageError::Io)?;
     Ok((header[0], body))
 }
 fn cstring(bytes: &[u8]) -> Option<(&str, &[u8])> {
@@ -1302,14 +1370,14 @@ async fn results(
     let mut error = None;
     let protocol = || unknown("postgres_protocol");
     loop {
-        let (tag, body) = read_message(postgres)
-            .await
-            .map_err(|_| unknown("postgres_error"))?;
-        // Each message is leased while it is held.
+        let (tag, body) =
+            read_message_bounded(postgres, MAX_RESPONSE_BYTES, Some(&mut answer.memory))
+                .await
+                .map_err(|err| match err {
+                    ReadMessageError::Memory => unknown("memory_capacity"),
+                    ReadMessageError::Io => unknown("postgres_error"),
+                })?;
         let held = body.len();
-        if !answer.memory.grow(held) {
-            return Err(unknown("memory_capacity"));
-        }
         let step = match tag {
             b'1' | b'2' | b'3' | b'N' | b'S' | b'A' => Ok(()),
             b'T' => row_description(&body)
@@ -1370,7 +1438,9 @@ async fn recycle(
         && timeout(Duration::from_secs(5), async {
             let mut ready = 0;
             while ready < expected {
-                match read_message(&mut backend.postgres).await {
+                match read_message_bounded(&mut backend.postgres, MAX_RECYCLE_MESSAGE_BYTES, None)
+                    .await
+                {
                     Ok((b'Z', body)) => {
                         ready += 1;
                         if ready == expected && body != b"I" {

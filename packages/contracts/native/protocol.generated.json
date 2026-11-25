@@ -42,6 +42,7 @@
     "accessClientIdHeader": "CF-Access-Client-Id",
     "accessClientSecretHeader": "CF-Access-Client-Secret",
     "accessSecretsIncomplete": "access_secrets_incomplete",
+    "accessSecretsMissing": "access_secrets_missing",
     "decoySaltDomain": "pgcf.edge.decoy-scram-salt/v1\n",
     "wakeRouteTokenPrefix": "v5",
     "wakeRouteSignatureDomain": "pgcf-route/v5\n",

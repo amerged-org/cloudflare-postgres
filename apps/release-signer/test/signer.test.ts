@@ -703,6 +703,9 @@ describe("its own configuration", () => {
       env({ SIGNER_REF: "main" }),
       env({ SIGNER_WORKFLOW: "ci.yml" }),
       env({ SIGNER_WORKFLOW: undefined }),
+      env({ SIGNER_AUDIENCE: "http://signer.example.com" }),
+      env({ SIGNER_AUDIENCE: "https://signer.example.com/extra" }),
+      env({ SIGNER_AUDIENCE: "not-a-url" }),
     ];
     for (const config of broken) {
       const response = await h.post({ env: config });
@@ -711,6 +714,23 @@ describe("its own configuration", () => {
       expect(JSON.parse(text)).toEqual({ error: "signer_misconfigured" });
       expect(text).not.toContain("SECRET-VALUE");
     }
+    const pinned = "https://pinned-signer.example.com";
+    expect(
+      (
+        await h.post({
+          env: env({ SIGNER_AUDIENCE: pinned }),
+          token: await github.mint(claims(T0)),
+        })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await h.post({
+          env: env({ SIGNER_AUDIENCE: pinned }),
+          token: await github.mint(claims(T0, { aud: pinned })),
+        })
+      ).status,
+    ).toBe(200);
   });
 
   it("logs the release it signed and why it refused, and no token, key or digest", async () => {

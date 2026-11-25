@@ -1,20 +1,21 @@
--- pgcf-schema-revision: 3
--- (The revision covers baseline.sql too, which the agent applies before this file; revision 3 changed
--- only baseline.sql, and revision 2 added it, each leaving this file as it was.)
+-- pgcf-schema-revision: 4
+-- (The revision covers baseline.sql too, which the agent applies before this file; revision 4
+-- refuses tables whose column type graph carries a user-defined cast to json/jsonb or a non-C
+-- output function before pgcf.capture() calls to_jsonb, so tenant code never runs as "pgcf-events".)
 -- The platform schema of a tenant database (plan database-events-and-schedules, 4.5). The agent
 -- runs this file as the cluster's superuser between BEGIN and COMMIT, with search_path set to
 -- pg_catalog, so every name is qualified.
 --
 -- Who owns what decides who can attach code to the outbox. The schema and its two tables belong
--- to the superuser that runs this file, never to a role the tenant's code can run as: the two
--- SECURITY DEFINER functions belong to the role "pgcf-events", which owns nothing else and holds
--- only INSERT and SELECT on the outbox and SELECT on the settings. Code that runs as "pgcf-events"
--- (a cast on a captured column, which pgcf.capture calls through to_jsonb, is enough) can read the
--- outbox, add rows and alter the two functions, but it cannot create a trigger, a rule or a function
--- in the schema nor change a table. The CHECKs on pgcf.outbox bound every row it can add: the seq
--- and epoch ranges, the payload size and its depth. The drain runs as the superuser and reads every
--- row as hostile input, and nothing in the schema reaches outside the database: the platform role
--- logs in to nothing and holds no grant beyond the schema's two tables and functions.
+-- to the superuser that runs this file, never to a role the tenant's code can run as. The two
+-- SECURITY DEFINER functions belong to "pgcf-events", which owns nothing else and holds only
+-- INSERT and SELECT on the outbox and SELECT on the settings. Before pgcf.capture() converts OLD
+-- or NEW with to_jsonb, it walks the column type graph of TG_RELID and refuses any non-built-in
+-- cast to json/jsonb or non-C/internal output function, so no tenant SQL can execute as
+-- "pgcf-events". The CHECKs on pgcf.outbox bound every row: the seq and epoch ranges, the payload
+-- size and its depth. The drain runs as the superuser and reads every row as hostile input, and
+-- nothing in the schema reaches outside the database: the platform role logs in to nothing and
+-- holds no grant beyond the schema's two tables and functions.
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = 'pgcf' AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid = n.nspowner AND r.rolsuper)) THEN
@@ -90,6 +91,8 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS pgcf._enqueue(pg_catalog.text, pg_catalog.jsonb);
+
 CREATE OR REPLACE FUNCTION pgcf.capture()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -114,6 +117,42 @@ BEGIN
   END IF;
   IF TG_NARGS = 0 THEN
     RAISE EXCEPTION 'pgcf.capture needs the columns to publish' USING ERRCODE = '22023';
+  END IF;
+  -- Refuse any table whose column type graph carries a user-defined cast to json/jsonb or a
+  -- non-C/internal output function so to_jsonb(OLD)/to_jsonb(NEW) can never run tenant SQL as
+  -- "pgcf-events".
+  IF EXISTS (
+    WITH RECURSIVE types(oid) AS (
+      SELECT a.atttypid
+      FROM pg_catalog.pg_attribute a
+      WHERE a.attrelid = TG_RELID AND a.attnum > 0 AND NOT a.attisdropped
+      UNION
+      SELECT next_oid
+      FROM types cur
+      JOIN pg_catalog.pg_type t ON t.oid = cur.oid
+      LEFT JOIN pg_catalog.pg_range r ON r.rngtypid = t.oid OR r.rngmultitypid = t.oid
+      LEFT JOIN pg_catalog.pg_attribute ca
+        ON t.typtype = 'c' AND ca.attrelid = t.typrelid AND ca.attnum > 0 AND NOT ca.attisdropped
+      CROSS JOIN LATERAL (
+        VALUES (t.typelem), (t.typbasetype), (r.rngsubtype), (ca.atttypid)
+      ) v(next_oid)
+      WHERE next_oid IS NOT NULL AND next_oid <> 0
+    )
+    SELECT 1
+    FROM types u
+    JOIN pg_catalog.pg_type t ON t.oid = u.oid
+    LEFT JOIN pg_catalog.pg_proc outp ON outp.oid = t.typoutput
+    LEFT JOIN pg_catalog.pg_language outl ON outl.oid = outp.prolang
+    WHERE EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_cast c
+      WHERE c.castsource = u.oid
+        AND c.casttarget IN ('pg_catalog.json'::pg_catalog.regtype, 'pg_catalog.jsonb'::pg_catalog.regtype)
+        AND c.castfunc >= 16384
+    )
+    OR (outl.lanname IS NOT NULL AND outl.lanname NOT IN ('internal', 'c'))
+  ) THEN
+    RAISE EXCEPTION 'pgcf.capture does not support columns with custom JSON casts' USING ERRCODE = '42501';
   END IF;
   IF TG_OP <> 'INSERT' THEN
     stale := pg_catalog.to_jsonb(OLD);
