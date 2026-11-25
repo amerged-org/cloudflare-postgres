@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  isAllowedWebhookHeaderName,
   WEBHOOK_DELIVERY_ID_HEADER,
   WEBHOOK_EVENT_ID_HEADER,
   WEBHOOK_SIGNATURE_HEADER,
@@ -7,7 +8,11 @@ import {
 } from "@pgcf/contracts/webhooks";
 import { sealer } from "../crypto/keyring.ts";
 import type { Env } from "../env.ts";
-import { checkWebhookUrl } from "./webhook-url.ts";
+import {
+  checkWebhookUrl,
+  webhookUrlOptions,
+  type WebhookUrlOptions,
+} from "./webhook-url.ts";
 import {
   parseRetryAfter,
   WEBHOOK_ATTEMPT_TIMEOUT_MS,
@@ -98,8 +103,9 @@ export async function postEnvelope(
   subscription: SubscriptionSecrets,
   envelope: WebhookEnvelope,
   deliveryId: string,
+  urlOptions?: WebhookUrlOptions,
 ): Promise<AttemptResult> {
-  const url = checkWebhookUrl(subscription.url);
+  const url = checkWebhookUrl(subscription.url, urlOptions);
   if (!url.ok) return { kind: "permanent", status: null };
   const body = JSON.stringify(envelope);
   const signature = await signWebhook(
@@ -107,19 +113,21 @@ export async function postEnvelope(
     Math.floor(Date.now() / 1000),
     body,
   );
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(subscription.headers)) {
+    if (isAllowedWebhookHeaderName(name)) headers.set(name, value);
+  }
+  headers.set("Content-Type", "application/json");
+  headers.set("User-Agent", WEBHOOK_USER_AGENT);
+  headers.set(WEBHOOK_SIGNATURE_HEADER, signature);
+  headers.set(WEBHOOK_EVENT_ID_HEADER, envelope.id);
+  headers.set(WEBHOOK_DELIVERY_ID_HEADER, deliveryId);
   let response: Response;
   try {
     response = await fetch(url.url, {
       method: "POST",
       redirect: "manual",
-      headers: {
-        ...subscription.headers,
-        "Content-Type": "application/json",
-        "User-Agent": WEBHOOK_USER_AGENT,
-        [WEBHOOK_SIGNATURE_HEADER]: signature,
-        [WEBHOOK_EVENT_ID_HEADER]: envelope.id,
-        [WEBHOOK_DELIVERY_ID_HEADER]: deliveryId,
-      },
+      headers,
       body,
       signal: AbortSignal.timeout(WEBHOOK_ATTEMPT_TIMEOUT_MS),
     });
@@ -163,5 +171,10 @@ export async function attemptDelivery(
   // A delivery is stored for the project of its event; another project's subscription never gets it.
   if (subscription.projectId !== envelope.project_id)
     return { kind: "permanent", status: null };
-  return postEnvelope(subscription, envelope, deliveryId);
+  return postEnvelope(
+    subscription,
+    envelope,
+    deliveryId,
+    webhookUrlOptions(env),
+  );
 }

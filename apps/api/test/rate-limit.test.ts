@@ -60,6 +60,32 @@ it("does not limit the health check or the node link path, even past the source'
   expect(limit).not.toHaveBeenCalled();
 });
 
+it("limits unauthenticated and installer /node/v1 endpoints", async () => {
+  const limit = vi.fn(async () => ({ success: false }));
+  const bindings = { API_RATE_LIMITER: { limit } } as never;
+  for (const [method, path] of [
+    ["GET", "/node/v1/openapi.json"],
+    ["GET", "/node/v1/releases/1.0.0/pgcf-agent"],
+    ["POST", "/node/v1/enroll"],
+    ["POST", "/node/v1/installer/progress"],
+  ] as const) {
+    const response = await request(
+      path,
+      "unused",
+      method,
+      method === "POST" ? {} : undefined,
+      null,
+      { "CF-Connecting-IP": SOURCE },
+      bindings,
+    );
+    expect(await refusal(response), `${method} ${path}`).toMatchObject({
+      status: 429,
+      code: "rate_limited",
+    });
+  }
+  expect(limit).toHaveBeenCalledTimes(4);
+});
+
 it("refuses a source past its budget before the key is read, and admits the next one", async () => {
   const limit = vi.fn(async () => ({ success: false }));
   const bindings = { API_RATE_LIMITER: { limit } } as never;

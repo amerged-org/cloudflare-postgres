@@ -173,6 +173,13 @@ describe("the installer's progress", () => {
 
   it("refuses a body that is not a checkpoint and a token that is not a progress token", async () => {
     const i = await installed([]);
+    expect(
+      (await progress(i.issued.progress_token, "started", "", "192.0.2.99"))
+        .status,
+    ).toBe(403);
+    expect(
+      (await progress(i.issued.progress_token, "started", "", null)).status,
+    ).toBe(403);
     expect((await progress(i.issued.progress_token, "teapot")).status).toBe(
       400,
     );
@@ -474,6 +481,14 @@ describe("an enrollment that raises an alert", () => {
     ).toBe(401);
     expect((await enroll(i.request, "192.0.2.99")).status).toBe(403);
     expect(await refusal(i.id)).toEqual({ refusal: null, refused_at: null });
+    expect((await enroll(i.request)).status).toBe(200);
+    expect((await enroll(i.request, "192.0.2.99")).status).toBe(403);
+    expect((await enroll(i.request)).status).toBe(200);
+    await env.DB.prepare(
+      "UPDATE node_installs SET enrolled_at=NULL,enrolled_public_key=NULL,enrolled_node_uid=NULL WHERE node_id=?",
+    )
+      .bind(i.id)
+      .run();
     await env.DB.prepare(
       "UPDATE node_installs SET expires_at=?,issued_at=? WHERE node_id=?",
     )

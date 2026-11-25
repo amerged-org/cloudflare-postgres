@@ -126,16 +126,25 @@ function statement(value: unknown): Statement {
   )
     throw invalid();
   const params = value.params ?? [];
-  if (!Array.isArray(params)) throw invalid();
+  if (!Array.isArray(params) || params.length > 65_535) throw invalid();
+  const normalized = params.map((param: unknown) => {
+    if (param === null || typeof param === "string") return param;
+    if (typeof param === "number" || typeof param === "boolean")
+      return String(param);
+    throw invalid();
+  });
+  if (
+    value.query.includes("\0") ||
+    normalized.some((param) => param !== null && param.includes("\0"))
+  )
+    throw new SqlFailure(
+      "22021",
+      'invalid byte sequence for encoding "UTF8": 0x00',
+    );
   return {
     query: value.query,
     // The driver sends text or null; other JSON scalars are sent as their text.
-    params: params.map((param: unknown) => {
-      if (param === null || typeof param === "string") return param;
-      if (typeof param === "number" || typeof param === "boolean")
-        return String(param);
-      throw invalid();
-    }),
+    params: normalized,
   };
 }
 

@@ -5,7 +5,7 @@
 //! file of their own that the database's `postgresql.conf` includes with
 //! `include_if_exists = 'pgcf-recovery.conf'`, so that the agent removes them without editing
 //! the configuration (step 5).
-use super::facts::Backup;
+use super::{facts::Backup, safe_fs};
 use crate::settings::Capacity;
 use std::{
     io,
@@ -87,31 +87,26 @@ fn absent_is_done(result: io::Result<()>) -> io::Result<()> {
 /// does not wait on a pipe. The file is then created exclusively, which fails on a link that
 /// appears in between instead of following it, and is handed over by its descriptor.
 pub fn prepare(data_directory: &Path, settings: &str, uid: u32, gid: u32) -> io::Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
-    if !std::fs::symlink_metadata(data_directory)?.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the restored data directory is no directory",
-        ));
-    }
+    let dir = safe_fs::open_dir_root_nofollow(data_directory)?;
     for (file, content) in [(SETTINGS_FILE, settings), (SIGNAL_FILE, "")] {
-        absent_is_done(std::fs::remove_file(data_directory.join(file)))?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(data_directory.join(file))?;
-        file.write_all(content.as_bytes())?;
-        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
-        file.sync_all()?;
+        safe_fs::write_owned_at(&dir, file, content, uid, gid)?;
     }
-    std::fs::File::open(data_directory)?.sync_all()
+    dir.sync_all()
 }
 /// Removes the settings, the signal file and the operation's spool.
 pub fn finish(data_directory: &Path, spool: &Path) -> io::Result<()> {
-    absent_is_done(std::fs::remove_file(data_directory.join(SETTINGS_FILE)))?;
-    absent_is_done(std::fs::remove_file(data_directory.join(SIGNAL_FILE)))?;
-    absent_is_done(std::fs::remove_dir_all(spool))
+    let dir = safe_fs::open_dir_root_nofollow(data_directory)?;
+    safe_fs::unlink_at(&dir, SETTINGS_FILE)?;
+    safe_fs::unlink_at(&dir, SIGNAL_FILE)?;
+    match std::fs::symlink_metadata(spool) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the recovery spool is a symlink",
+        )),
+        Ok(_) => absent_is_done(std::fs::remove_dir_all(spool)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// What the promoted database says of itself.
@@ -323,6 +318,14 @@ mod tests {
         std::fs::write(data.join(SETTINGS_FILE).join("kept"), "x").unwrap();
         assert!(prepare_within_five_seconds(&data, "a = 1\n").is_err());
         assert!(data.join(SETTINGS_FILE).join("kept").exists());
+
+        // finish must also refuse a symlinked data directory and leave its target untouched.
+        std::fs::write(elsewhere.join(SETTINGS_FILE), "other-tenant").unwrap();
+        assert!(finish(&volume.join("data"), &volume.join("spool-none")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join(SETTINGS_FILE)).unwrap(),
+            "other-tenant"
+        );
     }
 
     fn backup() -> Backup {

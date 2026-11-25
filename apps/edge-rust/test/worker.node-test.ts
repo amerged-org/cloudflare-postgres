@@ -102,6 +102,11 @@ test(
       services: [{ binding: "GATEWAY", service: "test-gateway" }],
       ratelimits: [
         {
+          name: "SOURCE_RATE_LIMITER",
+          namespace_id: "14",
+          simple: { limit: 12000, period: 60 as const },
+        },
+        {
           name: "CONNECTION_RATE_LIMITER",
           namespace_id: namespace,
           simple: { limit, period: 60 as const },
@@ -772,14 +777,14 @@ test(
         },
       );
       await t.test(
-        "the limiters and the Actor admit together, so a connect the limiter denied was still admitted",
+        "a rate-limited connect is refused before the Actor is admitted",
         async () => {
           await reset();
           const { database } = await seed();
           const opts = { worker: "limited-edge", ip: "198.51.100.7" };
           await open(database, opts);
           assert.equal(await sqlstate(await open(database, opts)), "53300");
-          assert.equal((await diagnostics(database)).received.length, 2);
+          assert.equal((await diagnostics(database)).received.length, 1);
           assert.equal((await stats()).length, 1);
         },
       );
@@ -1223,16 +1228,33 @@ test(
           await gateway.fetch("/reset");
           assert.equal((await select("access-edge")).status, 200);
           assert.deepEqual(await presented(), token);
-          // Without the secrets nothing is presented, whatever the caller sends.
+          // Without the secrets a public gateway refuses fail-closed before sending anything.
           await gateway.fetch("/reset");
-          await open(database, {
-            worker: "plain-public-edge",
-            headers: caller,
-          });
-          assert.deepEqual(await presented(), {});
+          server.clearLogs();
+          assert.equal(
+            await sqlstate(
+              await open(database, {
+                worker: "plain-public-edge",
+                headers: caller,
+              }),
+            ),
+            "08006",
+          );
+          assert.equal((await stats()).length, 0);
+          assert.equal(
+            (await logged("conn_admission")).config_error,
+            "access_secrets_missing",
+          );
           await gateway.fetch("/reset");
-          await select("plain-public-edge");
-          assert.deepEqual(await presented(), {});
+          server.clearLogs();
+          const missingAccessSql = await select("plain-public-edge");
+          assert.equal(missingAccessSql.status, 400);
+          assert.equal(missingAccessSql.json.code, "08006");
+          assert.equal((await stats()).length, 0);
+          assert.equal(
+            (await logged("sql_admission")).config_error,
+            "access_secrets_missing",
+          );
           // A gateway on a service binding is not behind Access: it gets nothing, with the
           // secrets set or not.
           await route(database, "gateway_binding='GATEWAY'");

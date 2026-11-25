@@ -21,7 +21,37 @@ export type JobRun =
 
 /** A wake is awaited for at most 60 s, and the statements may take their own timeout. */
 const WAKE_ALLOWANCE_MS = 75_000;
+const MAX_ERROR_BODY_BYTES = 8192;
 const HOST = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i;
+
+async function readBoundedText(
+  response: Response,
+  limit: number,
+): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const take = value.subarray(0, limit - total);
+      chunks.push(take);
+      total += take.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(combined);
+}
 
 const classified = (
   outcome: JobClassification["outcome"],
@@ -114,7 +144,7 @@ export async function runScheduleJob(env: Env, job: JobSpec): Promise<JobRun> {
   let body: unknown = null;
   if (response.status === 400) {
     try {
-      body = JSON.parse((await response.text()).slice(0, 8192));
+      body = JSON.parse(await readBoundedText(response, MAX_ERROR_BODY_BYTES));
     } catch {
       body = null;
     }

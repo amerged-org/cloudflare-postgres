@@ -1,4 +1,4 @@
--- pgcf-schema-revision: 3
+-- pgcf-schema-revision: 4
 -- The hardening baseline of a tenant database. The agent runs this file as the cluster's superuser
 -- at every install of the platform schema, before it looks at the schema: it holds whoever owns the
 -- name pgcf. It is one batch, so it is atomic, and running it again changes nothing. The names are

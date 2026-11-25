@@ -11,6 +11,7 @@ import {
 } from "@pgcf/contracts";
 import { ApiError } from "../api-error.ts";
 import type { ApiContext } from "../env.ts";
+import { auditBeforeChange } from "../middleware/audit.ts";
 import {
   bearer,
   getAuth,
@@ -25,6 +26,8 @@ import { page } from "./pagination.ts";
 import { keyRow, type Row } from "./rows.ts";
 
 const DAY_MS = 86_400_000;
+/** Synthetic audit actor ID for requests authenticated with the owner's `BOOTSTRAP_TOKEN`. */
+export const BOOTSTRAP_AUDIT_KEY_ID = "key_00000000000000000000";
 
 /**
  * When the new key stops working. A time asked for must lie ahead, and an administrator key's no
@@ -96,6 +99,7 @@ export async function createApiKey(
         "forbidden",
         "Bootstrap makes the first admin key, or integrator keys",
       );
+    await auditBeforeChange(c, { id: BOOTSTRAP_AUDIT_KEY_ID, scope: "admin" });
     const id = newApiKeyId();
     const generated = newApiKey();
     const created = new Date();
@@ -206,6 +210,7 @@ async function createOwnerIntegratorKey(
   c: ApiContext,
   body: ApiKeyCreate,
 ): Promise<Response> {
+  await auditBeforeChange(c, { id: BOOTSTRAP_AUDIT_KEY_ID, scope: "admin" });
   const project = await c.env.DB.prepare(
     "SELECT id FROM projects WHERE id = ? AND deleted_at IS NULL",
   )

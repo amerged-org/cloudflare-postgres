@@ -428,6 +428,16 @@ impl Server {
             Ok(credential) => credential,
             Err(reason) => return entry.failed(reason),
         };
+        // Refuse a symlink or special file planted by a tenant inside pg_wal before spawning
+        // barman-cloud-wal-archive (which runs with network access and R2 credentials).
+        let wal_ok =
+            super::safe_fs::open_dir_root_nofollow(&registration.database.data_directory())
+                .and_then(|data| super::safe_fs::open_dir_child_same_dev(&data, "pg_wal"))
+                .and_then(|wal| super::safe_fs::stat_regular_same_dev(&wal, name))
+                .is_ok();
+        if !wal_ok {
+            return entry.failed("unsafe_wal_path");
+        }
         let job = Job::wal_archive(
             &registration.store,
             &registration.database,
@@ -508,12 +518,15 @@ impl Server {
                 Ok(outcome) => outcome,
                 Err(Busy) => return Reply::Failed(Some("agent_busy")),
             };
-            if !(outcome.succeeded() && target.is_file()) {
+            let fetched_stat = if outcome.succeeded() {
+                stat_relative_regular(&registration.database.data_directory(), destination).ok()
+            } else {
+                None
+            };
+            let Some(stat) = fetched_stat else {
                 return fetch_failed(recovery, registration, name, &outcome, &credential);
-            }
-            let whole = !is_segment(name)
-                || std::fs::metadata(&target)
-                    .is_ok_and(|file| file.len() == recovery.segment_bytes);
+            };
+            let whole = !is_segment(name) || stat.st_size as u64 == recovery.segment_bytes;
             if whole {
                 return Reply::Ok;
             }
@@ -522,6 +535,23 @@ impl Server {
         }
         Reply::Failed(Some("fetch_wrong_size"))
     }
+}
+
+/// Stats a relative path below `data_directory` without following symlinks on any component.
+fn stat_relative_regular(data_directory: &Path, relative: &str) -> std::io::Result<libc::stat> {
+    let mut parts = relative.split('/').peekable();
+    let mut dir = super::safe_fs::open_dir_root_nofollow(data_directory)?;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_some() {
+            dir = super::safe_fs::open_dir_child_same_dev(&dir, part)?;
+        } else {
+            return super::safe_fs::stat_regular_same_dev(&dir, part);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "empty relative path",
+    ))
 }
 
 /// The answer to a fetch that did not deliver the file.
@@ -1032,6 +1062,19 @@ mod tests {
         node.table.remove(DATABASE);
         assert_eq!(node.archive(SEGMENT).await, "failed unknown_database\n");
         assert_eq!(node.fixture.key_id(), None);
+    }
+
+    #[tokio::test]
+    async fn archiving_a_symlinked_wal_segment_is_refused_before_starting_barman() {
+        let node = Node::start("wal-symlink", AGENT_BOUND).await;
+        let outside = directory("wal-symlink-outside").join("secret");
+        std::fs::write(&outside, b"host-secret").unwrap();
+        let wal = node.volume().join("data/pg_wal").join(SEGMENT);
+        std::fs::remove_file(&wal).unwrap();
+        std::os::unix::fs::symlink(&outside, &wal).unwrap();
+        assert_eq!(node.archive(SEGMENT).await, "failed unsafe_wal_path\n");
+        assert_eq!(node.fixture.key_id(), None, "no job ran");
+        assert!(node.log().entries().unwrap().is_empty());
     }
 
     /// A caller that holds no database now (a slot's uid before its bind or after its stop, or a

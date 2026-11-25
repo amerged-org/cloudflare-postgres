@@ -119,6 +119,18 @@ fn a_request_to_the_gateway_is_bounded_as_the_gateway_bounds_it() {
         SqlFailure::too_large()
     );
     assert_eq!(max_statements(), 256);
+    let too_many_params = format!(
+        r#"{{"query":"SELECT 1","params":[{}]}}"#,
+        std::iter::repeat_n("1", 65_536)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    assert_eq!(
+        sql::statements(&too_many_params).unwrap_err(),
+        SqlFailure::invalid()
+    );
+    let nul_query = sql::statements(r#"{"query":"SELECT '\u0000'"}"#).unwrap_err();
+    assert_eq!(nul_query.code, "22021");
 }
 
 #[test]

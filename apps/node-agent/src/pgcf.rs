@@ -20,7 +20,7 @@ use tokio::sync::Notify;
 /// The revision of what `install` applies: `schema.sql` and `baseline.sql`, each of which carries
 /// it as its first line. A database whose record holds an earlier one is installed again at its
 /// next refresh, which is how a change to either file reaches the databases that exist.
-pub const SCHEMA_REVISION: u32 = 3;
+pub const SCHEMA_REVISION: u32 = 4;
 /// The role that owns the platform schema and its objects.
 pub const PLATFORM_ROLE: &str = "pgcf-events";
 /// The channel `pgcf.emit` notifies after each row, so the drain wakes up.
@@ -346,6 +346,7 @@ mod tests {
     #[test]
     fn the_schema_grants_emit_to_the_owner_role_and_rejects_the_contract_depth() {
         assert!(SCHEMA.contains(&format!("TO \"{OWNER_ROLE}\" WITH GRANT OPTION")));
+        assert!(SCHEMA.contains("pgcf.capture does not support columns with custom JSON casts"));
         let depth = constant("NODE_DATA_EVENT_DEPTH_MAX").as_u64().unwrap();
         assert!(SCHEMA.contains(&format!("'$.**{{{} to last}}'", depth + 1)));
     }
@@ -1335,76 +1336,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tenant_cast_that_runs_as_the_platform_role_cannot_attach_code_to_the_outbox() {
+    async fn a_tenant_cast_inside_capture_is_refused_before_running_as_the_platform_role() {
         let Some(cluster) = cluster_with_tenant("pgcf-cast").await else {
             return;
         };
         let session = events(&cluster).await;
         install(&session, &SETTINGS, false).await.unwrap();
         let app = as_role(&cluster, "app", 1).await;
-        // pgcf.capture calls to_jsonb on the row, which runs this cast to json as the platform role.
+        // pgcf.capture refuses any table whose column type graph has a user-defined JSON cast
+        // before calling to_jsonb, so tenant SQL never executes as "pgcf-events".
         app.batch_execute(
             "CREATE TYPE hostile AS ENUM ('a');
-             CREATE TABLE attempts (who text, what text, state text);
+             CREATE TABLE attempts (who text);
              GRANT INSERT ON attempts TO \"pgcf-events\";
              CREATE FUNCTION hostile_json(value hostile) RETURNS json LANGUAGE plpgsql AS $f$
-             DECLARE
-               attack text;
              BEGIN
-               FOREACH attack IN ARRAY ARRAY[
-                 'CREATE FUNCTION pgcf.spy() RETURNS trigger LANGUAGE plpgsql AS $g$ BEGIN RETURN OLD; END $g$',
-                 'CREATE TRIGGER spy BEFORE DELETE ON pgcf.outbox FOR EACH ROW EXECUTE FUNCTION pgcf.spy()',
-                 'ALTER TABLE pgcf.outbox DISABLE TRIGGER ALL',
-                 'DELETE FROM pgcf.outbox'
-               ] LOOP
-                 BEGIN
-                   EXECUTE attack;
-                   INSERT INTO public.attempts VALUES (current_user, attack, 'ok');
-                 EXCEPTION WHEN OTHERS THEN
-                   INSERT INTO public.attempts VALUES (current_user, attack, SQLSTATE);
-                 END;
-               END LOOP;
+               INSERT INTO public.attempts VALUES (current_user);
                RETURN pg_catalog.to_json(value::pg_catalog.text);
              END $f$;
              CREATE CAST (hostile AS json) WITH FUNCTION hostile_json(hostile) AS IMPLICIT;
              CREATE TABLE tenant_rows (id int, m hostile);
-             CREATE TRIGGER outbox AFTER INSERT ON tenant_rows FOR EACH ROW EXECUTE FUNCTION pgcf.capture('id', 'm');
-             INSERT INTO tenant_rows VALUES (1, 'a');",
+             CREATE TRIGGER outbox AFTER INSERT ON tenant_rows FOR EACH ROW EXECUTE FUNCTION pgcf.capture('id', 'm');",
         )
         .await
         .unwrap();
-        let attempts = app
-            .query("SELECT who, state FROM attempts", &[])
-            .await
-            .unwrap()
-            .iter()
-            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
-            .collect::<Vec<_>>();
-        assert_eq!(attempts.len(), 4);
-        assert!(
-            attempts.iter().all(|(who, _)| who == PLATFORM_ROLE),
-            "the cast did not run as the platform role: {attempts:?}"
+        assert_eq!(
+            refused(&app, "INSERT INTO tenant_rows VALUES (1, 'a')").await,
+            "42501"
         );
-        assert!(
-            attempts.iter().all(|(_, state)| state == "42501"),
-            "{attempts:?}"
-        );
-        assert_eq!(count(&session).await, 1);
-        let triggers = session
-            .query(
-                "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgrelid = 'pgcf.outbox'::regclass AND NOT tgisinternal",
-                &[],
+        // Also refused when the custom-cast type is nested inside an array or composite column.
+        app.batch_execute(
+            "CREATE TABLE nested_rows (id int, items hostile[]);
+             CREATE TRIGGER outbox_nested AFTER INSERT ON nested_rows FOR EACH ROW EXECUTE FUNCTION pgcf.capture('id');",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refused(
+                &app,
+                "INSERT INTO nested_rows VALUES (1, ARRAY['a']::hostile[])"
             )
-            .await
-            .unwrap();
-        assert_eq!(triggers[0].get::<_, i64>(0), 0);
-        assert_eq!(delete(&session, &[1]).await.unwrap(), 1);
-        assert_eq!(count(&session).await, 0);
+            .await,
+            "42501"
+        );
+        // The cast function never ran at all and nothing reached pgcf.outbox.
         let attempts = app
             .query("SELECT count(*) FROM attempts", &[])
             .await
             .unwrap();
-        assert_eq!(attempts[0].get::<_, i64>(0), 4);
+        assert_eq!(attempts[0].get::<_, i64>(0), 0);
+        assert_eq!(count(&session).await, 0);
+        // Plain enum columns without a custom JSON cast continue to be captured normally.
+        app.batch_execute(
+            "CREATE TYPE plain_status AS ENUM ('open', 'closed');
+             CREATE TABLE plain_rows (id int, s plain_status);
+             CREATE TRIGGER outbox_plain AFTER INSERT ON plain_rows FOR EACH ROW EXECUTE FUNCTION pgcf.capture('id', 's');
+             INSERT INTO plain_rows VALUES (1, 'open');",
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&session).await, 1);
+        assert_eq!(delete(&session, &[1]).await.unwrap(), 1);
+        assert_eq!(count(&session).await, 0);
         session
             .batch(&format!("SET ROLE \"{PLATFORM_ROLE}\""))
             .await

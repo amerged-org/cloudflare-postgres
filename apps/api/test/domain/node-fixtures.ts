@@ -101,12 +101,18 @@ export async function newKey() {
     publicKey: await nodePublicKey(pair.publicKey as NodeKey),
   };
 }
-export const progress = (token: string, checkpoint: string, detail = "") =>
+export const progress = (
+  token: string,
+  checkpoint: string,
+  detail = "",
+  address: string | null = v4,
+) =>
   rawRequest("/node/v1/installer/progress", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
+      ...(address ? { "CF-Connecting-IP": address } : {}),
     },
     body: JSON.stringify({ checkpoint, detail }),
   });

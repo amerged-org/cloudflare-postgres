@@ -376,6 +376,7 @@ function scopedComponents(document: Document): void {
 }
 
 export function registerApiDocuments(app: ApiApp): void {
+  const cached = new Map<string, string>();
   for (const [scope, path, title, description] of scopes) {
     app.openAPIRegistry.registerPath({
       method: "get",
@@ -389,41 +390,50 @@ export function registerApiDocuments(app: ApiApp): void {
     });
     app.get(path, (c) => {
       const metadata = workerVersion(c.env);
-      const document = structuredClone(
-        app.getOpenAPI31Document({
-          openapi: "3.1.0",
-          info: {
-            title,
-            version: API_CONTRACT_VERSION,
-            ...(description === undefined ? {} : { description }),
-            "x-worker-version": metadata,
-          },
-        }),
-      );
-      document.paths = Object.fromEntries(
-        Object.entries(document.paths ?? {}).filter(([candidate]) =>
-          inScope(scope, candidate),
-        ),
-      );
-      for (const [candidate, item] of Object.entries(document.paths))
-        for (const method of methods) {
-          const operation = item[method];
-          if (operation)
-            describeOperation(
-              method.toUpperCase() + " " + candidate,
-              operation,
-            );
+      const cacheKey = `${scope}|${metadata.id}|${metadata.tag}|${metadata.timestamp}`;
+      let serialized = cached.get(cacheKey);
+      if (serialized === undefined) {
+        const document = structuredClone(
+          app.getOpenAPI31Document({
+            openapi: "3.1.0",
+            info: {
+              title,
+              version: API_CONTRACT_VERSION,
+              ...(description === undefined ? {} : { description }),
+              "x-worker-version": metadata,
+            },
+          }),
+        );
+        document.paths = Object.fromEntries(
+          Object.entries(document.paths ?? {}).filter(([candidate]) =>
+            inScope(scope, candidate),
+          ),
+        );
+        for (const [candidate, item] of Object.entries(document.paths))
+          for (const method of methods) {
+            const operation = item[method];
+            if (operation)
+              describeOperation(
+                method.toUpperCase() + " " + candidate,
+                operation,
+              );
+          }
+        scopedComponents(document);
+        conformToContracts(document);
+        for (const [name, documentation] of Object.entries(
+          componentDocumentation,
+        )) {
+          const schemas = document.components?.schemas as
+            Record<string, Record<string, unknown>> | undefined;
+          if (schemas?.[name]) Object.assign(schemas[name], documentation);
         }
-      scopedComponents(document);
-      conformToContracts(document);
-      for (const [name, documentation] of Object.entries(
-        componentDocumentation,
-      )) {
-        const schemas = document.components?.schemas as
-          Record<string, Record<string, unknown>> | undefined;
-        if (schemas?.[name]) Object.assign(schemas[name], documentation);
+        serialized = JSON.stringify(document);
+        if (cached.size >= 16) cached.clear();
+        cached.set(cacheKey, serialized);
       }
-      return c.json(document);
+      return c.body(serialized, 200, {
+        "Content-Type": "application/json; charset=UTF-8",
+      });
     });
   }
 }

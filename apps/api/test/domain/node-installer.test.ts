@@ -758,7 +758,10 @@ describe("the install of a node from a registered release, as the installer carr
     );
     const image = new URL(values.PGCF_IMAGE_URL!).pathname;
     expect((await rawRequest(image)).status).toBe(401);
-    const token = { Authorization: `Bearer ${values.PGCF_PROGRESS_TOKEN}` };
+    const token = {
+      Authorization: `Bearer ${values.PGCF_PROGRESS_TOKEN}`,
+      "CF-Connecting-IP": v4,
+    };
     const report = (checkpoint: string) =>
       progress(values.PGCF_PROGRESS_TOKEN!, checkpoint);
 

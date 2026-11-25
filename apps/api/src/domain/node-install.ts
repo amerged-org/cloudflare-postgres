@@ -144,6 +144,13 @@ export async function openInstall(c: ApiContext): Promise<InstallRow> {
     row.expires_at <= new Date().toISOString()
   )
     throw new ApiError("unauthorized", "Invalid installer credentials");
+  if (
+    !sourceAllowed(
+      c.req.header("CF-Connecting-IP"),
+      JSON.parse(row.allowed_sources_json) as string[],
+    )
+  )
+    throw new ApiError("forbidden", "Installer source refused");
   return row;
 }
 
@@ -261,6 +268,13 @@ export async function enrollNode(
   if (row.enrolled_at !== null) {
     if (row.enrolled_public_key !== request.public_key || row.expires_at <= now)
       throw await refuseInVain("repeat", "conflict");
+    if (
+      !sourceAllowed(
+        c.req.header("CF-Connecting-IP"),
+        JSON.parse(row.allowed_sources_json) as string[],
+      )
+    )
+      throw refuse("source", "forbidden");
     const same = await identityOf(c.env, request.node_id);
     if (same !== null) return c.json(same);
   }
