@@ -777,14 +777,14 @@ test(
         },
       );
       await t.test(
-        "the limiters and the Actor admit together, so a connect the limiter denied was still admitted",
+        "a rate-limited connect is refused before the Actor is admitted",
         async () => {
           await reset();
           const { database } = await seed();
           const opts = { worker: "limited-edge", ip: "198.51.100.7" };
           await open(database, opts);
           assert.equal(await sqlstate(await open(database, opts)), "53300");
-          assert.equal((await diagnostics(database)).received.length, 2);
+          assert.equal((await diagnostics(database)).received.length, 1);
           assert.equal((await stats()).length, 1);
         },
       );
@@ -1249,7 +1249,7 @@ test(
           server.clearLogs();
           const missingAccessSql = await select("plain-public-edge");
           assert.equal(missingAccessSql.status, 400);
-          assert.equal(missingAccessSql.body.code, "08006");
+          assert.equal(missingAccessSql.json.code, "08006");
           assert.equal((await stats()).length, 0);
           assert.equal(
             (await logged("sql_admission")).config_error,
